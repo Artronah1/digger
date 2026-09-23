@@ -1,12 +1,6 @@
-# Бинарники
 /digger
 /digger-arm64
 /digger-*
-
-# Временное
 *.log
 *.pcap
-/tmp/
-
-# Go
 *.test
