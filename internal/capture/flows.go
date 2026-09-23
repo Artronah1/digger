@@ -3,6 +3,7 @@ package capture
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -365,8 +366,11 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 					    }
 
 					    label := f.SNI
-					    if label == "" {
-						    label = f.Hostname
+					    if label == "" && f.Hostname != "" {
+						    // PTR-имена вида *.1e100.net неинформативны — не показываем
+						    if !strings.HasSuffix(f.Hostname, ".1e100.net") {
+							    label = f.Hostname
+						    }
 					    }
 					    if label == "" {
 						    label = f.Key.RemoteIP
