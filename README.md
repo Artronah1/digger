@@ -1,3 +1,5 @@
+![Release](https://img.shields.io/github/v/release/Artronah1/digger)
+![License](https://img.shields.io/github/license/Artronah1/digger)
 # digger
 
 Аудит сетевой приватности. Смотрит, что реально уходит с твоего устройства или роутера в интернет — и что из этого видно внешнему наблюдателю.
