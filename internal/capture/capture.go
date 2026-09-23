@@ -41,14 +41,18 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		}
 	}
 
+	anomalyDetector := NewAnomalyDetector()
+	flowTable := NewFlowTable()
+	flowTable.anomaly = anomalyDetector
+
 	return &Capture{
 		handle:     handle,
 		verbose:    verbose,
 		stopCh:     make(chan struct{}),
-		flows:      NewFlowTable(),
+		flows:      flowTable,
 		dnsTable:   NewDNSTable(),
 		dnsMapping: NewDNSMapping(),
-		anomaly:    NewAnomalyDetector(),
+		anomaly:    anomalyDetector,
 		localIPs:   localIPs,
 	}, nil
 }

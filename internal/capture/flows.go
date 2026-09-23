@@ -111,7 +111,8 @@ type FlowTable struct {
 	mu       sync.Mutex
 	flows    map[FlowKey]*FlowStats
 	resolver *dns.Resolver
-	arpTable map[string]string // IP -> MAC
+	arpTable map[string]string
+	anomaly  *AnomalyDetector
 
 	minPkts    int
 	hideIdle   bool
@@ -367,7 +368,6 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 
 					    label := f.SNI
 					    if label == "" && f.Hostname != "" {
-						    // PTR-имена вида *.1e100.net неинформативны — не показываем
 						    if !strings.HasSuffix(f.Hostname, ".1e100.net") {
 							    label = f.Hostname
 						    }
@@ -385,7 +385,7 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 						    process = f.Key.LocalIP
 					    }
 
-					    // ключ группы: label + process + proto (чтобы не смешивать разные процессы)
+					    // Добавляем флаг к label
 					    key := label + "|" + process + "|" + f.Key.Proto
 
 					    g, ok := groups[key]
