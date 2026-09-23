@@ -4,3 +4,4 @@
 *.log
 *.pcap
 *.test
+dist/
