@@ -735,3 +735,31 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 				    }
 				    fmt.Printf("%s %8d  %5.1f%%  %s\n", label, count, pct, bar)
 			    }
+
+
+			    // FindProcessByIP ищет процесс, у которого есть поток к указанному IP.
+			    // Используется для связи аномалий с процессами.
+			    func (ft *FlowTable) FindProcessByIP(ip string) string {
+				    ft.mu.Lock()
+				    defer ft.mu.Unlock()
+
+				    for _, f := range ft.flows {
+					    if f.Key.RemoteIP == ip && f.Comm != "" {
+						    return fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+					    }
+				    }
+				    return ""
+			    }
+
+			    // FindProcessByDomain ищет процесс по SNI-имени.
+			    func (ft *FlowTable) FindProcessByDomain(domain string) string {
+				    ft.mu.Lock()
+				    defer ft.mu.Unlock()
+
+				    for _, f := range ft.flows {
+					    if f.SNI == domain && f.Comm != "" {
+						    return fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+					    }
+				    }
+				    return ""
+			    }

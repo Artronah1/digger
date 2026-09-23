@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -25,6 +26,8 @@ func main() {
 	netmapFlag := flag.Bool("netmap", false, "показать карту policy routing/firewall и выйти")
 	dnsAge := flag.Duration("dns-age", 5*time.Minute, "показывать DNS-запросы не старше этого времени (0 = все)")
 	routerMode := flag.Bool("router-mode", false, "режим роутера: считать outbound всё, что не от самого роутера")
+	logFile := flag.String("log", "", "писать вывод в файл (по умолчанию только в stdout)")
+	showPTR := flag.Bool("show-ptr", false, "показывать PTR-запросы в DNS-таблице")
 	flag.Parse()
 
 	if *netmapFlag {
@@ -38,6 +41,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Если задан -log, пишем одновременно в stdout и в файл
+	var logWriter io.Writer = os.Stdout
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("не удалось открыть файл лога %s: %v", *logFile, err)
+		}
+		defer f.Close()
+		logWriter = io.MultiWriter(os.Stdout, f)
+	}
+
+	// Перенаправляем stdout на logWriter через pipe
+	origStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		log.Fatalf("не удалось создать pipe: %v", err)
+	}
+	os.Stdout = w
+
+	go func() {
+		io.Copy(logWriter, r)
+	}()
+
+	defer func() {
+		w.Close()
+		os.Stdout = origStdout
+	}()
+
 	cap, err := capture.New(*iface, *snaplen, *verbose)
 	if err != nil {
 		log.Fatalf("не удалось открыть интерфейс %s: %v", *iface, err)
@@ -48,6 +79,7 @@ func main() {
 	cap.SetHideIdle(*hideIdle)
 	cap.SetActiveOnly(*activeOnly)
 	cap.SetDNSAge(*dnsAge)
+	cap.SetShowPTR(*showPTR)
 	cap.SetProfile(*profile)
 	cap.SetRouterMode(*routerMode)
 

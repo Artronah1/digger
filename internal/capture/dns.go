@@ -27,15 +27,17 @@ type DNSQuery struct {
 
 // DNSTable — таблица наблюдённых DNS-запросов.
 type DNSTable struct {
-	mu       sync.Mutex
-	queries  map[string]*DNSQuery
-	maxAge   time.Duration // если > 0, старые записи не печатаются
+	mu      sync.Mutex
+	queries map[string]*DNSQuery
+	maxAge  time.Duration
+	showPTR bool
 }
 
 func NewDNSTable() *DNSTable {
 	return &DNSTable{
 		queries: make(map[string]*DNSQuery),
-		maxAge:  5 * time.Minute, // по умолчанию — показываем записи за 5 минут
+		maxAge:  5 * time.Minute,
+		showPTR: false,
 	}
 }
 
@@ -60,6 +62,13 @@ func (dt *DNSTable) SetMaxAge(d time.Duration) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 	dt.maxAge = d
+}
+
+// SetShowPTR включает/выключает показ PTR-запросов.
+func (dt *DNSTable) SetShowPTR(v bool) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.showPTR = v
 }
 
 // Update разбирает payload и, если это DNS-запрос, добавляет в таблицу.
@@ -140,20 +149,22 @@ func (dt *DNSTable) Print() {
 		return
 	}
 
-	// Фильтр по свежести
 	dt.mu.Lock()
 	maxAge := dt.maxAge
+	showPTR := dt.showPTR
 	dt.mu.Unlock()
 
-	queries := all
-	if maxAge > 0 {
-		cutoff := time.Now().Add(-maxAge)
-		queries = make([]DNSQuery, 0, len(all))
-		for _, q := range all {
-			if q.LastSeen.After(cutoff) {
-				queries = append(queries, q)
-			}
+	// Фильтр по свежести и PTR
+	queries := make([]DNSQuery, 0, len(all))
+	cutoff := time.Now().Add(-maxAge)
+	for _, q := range all {
+		if maxAge > 0 && !q.LastSeen.After(cutoff) {
+			continue
 		}
+		if !showPTR && strings.HasSuffix(q.Name, ".in-addr.arpa") {
+			continue
+		}
+		queries = append(queries, q)
 	}
 
 	if len(queries) == 0 {

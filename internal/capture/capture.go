@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ func (c *Capture) SetHideIdle(v bool)    { c.flows.SetHideIdle(v) }
 func (c *Capture) SetActiveOnly(n int)   { c.flows.SetActiveOnly(n) }
 func (c *Capture) SetProfile(sni string) { c.profileSNI = sni }
 func (c *Capture) SetDNSAge(d time.Duration) { c.dnsTable.SetMaxAge(d) }
+func (c *Capture) SetShowPTR(v bool) { c.dnsTable.SetShowPTR(v) }
 func (c *Capture) SetFilter(expr string) error { return c.handle.SetBPFFilter(expr) }
 func (c *Capture) SetRouterMode(v bool) { c.routerMode = v }
 
@@ -81,6 +83,7 @@ func (c *Capture) Run() {
 				c.flows.Print()
 				c.dnsTable.Print()
 				printAttribution(c.flows.Snapshot(), c.dnsMapping)
+				c.printAnomalies()
 				c.flows.PrintProfile(c.profileSNI)
 				if c.anomaly != nil {
 					c.anomaly.SaveHistory()
@@ -92,6 +95,7 @@ func (c *Capture) Run() {
 				c.flows.Print()
 				c.dnsTable.Print()
 				printAttribution(c.flows.Snapshot(), c.dnsMapping)
+				c.printAnomalies()
 				c.flows.PrintProfile(c.profileSNI)
 			case pkt, ok := <-packets:
 				if !ok {
@@ -214,14 +218,12 @@ func (c *Capture) process(pkt pcap.Packet) {
 
 				// Если это запрос (dstPort == 53) — проверяем аномалии
 				if dstPort == 53 && c.anomaly != nil {
-					// Утечка DNS?
-					if leak := c.anomaly.CheckDNSLeak(dstIP); leak != "" {
-						if name, _, ok := parseDNSQuery(payload); ok {
-							c.dnsTable.SetFlags(name, "A", srcIP, dstIP, leak)
-						}
-					}
-					// Новый домен / хеш-подобный?
 					if name, qtype, ok := parseDNSQuery(payload); ok {
+						// Утечка DNS?
+						if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
+							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
+						}
+						// Новый домен / хеш-подобный?
 						if flag := c.anomaly.CheckDomain(name, true); flag != "" {
 							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
 						}
@@ -285,6 +287,35 @@ func hasOption(opts []layers.TCPOption, kind layers.TCPOptionKind) bool {
 		}
 	}
 	return false
+}
+
+// printAnomalies выводит сводку подозрительных доменов с процессами.
+func (c *Capture) printAnomalies() {
+	if c.anomaly == nil {
+		return
+	}
+
+	records := c.anomaly.CollectAnomalies(5 * time.Minute)
+	if len(records) == 0 {
+		return
+	}
+
+	// Обогащаем процессы
+	flows := c.flows.Snapshot()
+	for i := range records {
+		if records[i].Process != "" {
+			continue
+		}
+		// Ищем процесс по SNI или по IP
+		for _, f := range flows {
+			if f.SNI == records[i].Domain && f.Comm != "" {
+				records[i].Process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+				break
+			}
+		}
+	}
+
+	c.anomaly.PrintAnomalies(5 * time.Minute)
 }
 
 	// isLANIP определяет, является ли IP локальным (RFC1918 или link-local).
