@@ -25,6 +25,9 @@ type AnomalyDetector struct {
 
 	// Записи для сводки
 	anomalies []AnomalyRecord
+
+	// Что уже показали (для дедупликации вывода)
+	printed map[string]bool
 }
 
 // AnomalyRecord — одна запись об аномалии.
@@ -52,6 +55,7 @@ func NewAnomalyDetector() *AnomalyDetector {
 		reportedNew:  make(map[string]time.Time),
 		reportedHash: make(map[string]time.Time),
 		reportedLeak: make(map[string]time.Time),
+		printed:      make(map[string]bool),
 	}
 	ad.loadHistory()
 	return ad
@@ -206,14 +210,33 @@ func (ad *AnomalyDetector) CollectAnomalies(window time.Duration) []AnomalyRecor
 }
 
 // PrintAnomalies выводит сводку подозрительного.
+// Печатает только те записи, которые ещё не выводились.
 func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 	records := ad.CollectAnomalies(window)
 	if len(records) == 0 {
 		return
 	}
 
-	fmt.Printf("\n=== ⚠ Подозрительное (за %s) ===\n", window)
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
+
+	// Фильтр — только новые
+	newRecords := make([]AnomalyRecord, 0)
 	for _, a := range records {
+		key := a.Kind + "|" + a.Domain + "|" + a.Detail
+		if ad.printed[key] {
+			continue
+		}
+		ad.printed[key] = true
+		newRecords = append(newRecords, a)
+	}
+
+	if len(newRecords) == 0 {
+		return
+	}
+
+	fmt.Printf("\n=== ⚠ Подозрительное (новое) ===\n")
+	for _, a := range newRecords {
 		ts := a.Time.Format("15:04:05")
 
 		kind := ""

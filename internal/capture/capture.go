@@ -302,16 +302,39 @@ func (c *Capture) printAnomalies() {
 
 	// Обогащаем процессы
 	flows := c.flows.Snapshot()
+
 	for i := range records {
 		if records[i].Process != "" {
 			continue
 		}
-		// Ищем процесс по SNI или по IP
+
+		// 1. Ищем процесс по SNI (прямое совпадение)
 		for _, f := range flows {
 			if f.SNI == records[i].Domain && f.Comm != "" {
 				records[i].Process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
 				break
 			}
+		}
+
+		// 2. Если не нашли — ищем по IP, в который резолвился домен
+		if records[i].Process == "" && c.dnsMapping != nil {
+			ips := c.dnsMapping.IPsForName(records[i].Domain)
+			for _, ip := range ips {
+				for _, f := range flows {
+					if f.Key.RemoteIP == ip && f.Comm != "" {
+						records[i].Process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+						break
+					}
+				}
+				if records[i].Process != "" {
+					break
+				}
+			}
+		}
+
+		// 3. Обновляем запись в детекторе
+		if records[i].Process != "" {
+			c.anomaly.SetProcessForDomain(records[i].Domain, records[i].Process)
 		}
 	}
 
