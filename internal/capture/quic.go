@@ -8,7 +8,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"sync"
 )
+
+// clientDCIDsBySCID хранит связку SCID клиента → DCID клиента.
+// Нужна для расшифровки серверных Initial: их ключи выводятся
+// из DCID клиентского Initial, который в серверном пакете не виден.
+var clientDCIDsBySCID sync.Map
 
 // QUIC v1 salt из RFC 9001
 var quicV1Salt = []byte{
@@ -243,7 +249,7 @@ func decryptInitial(info *quicInitialInfo, isServer bool) ([]byte, error) {
 }
 
 // extractQUICSNI парсит QUIC Initial и извлекает SNI.
-func extractQUICSNI(payload []byte, srcPort uint16) string {
+func extractQUICSNI(payload []byte, srcIP, dstIP string, srcPort, dstPort uint16) string {
 	info, ok := parseQUICInitial(payload)
 	if !ok {
 		return ""
@@ -254,14 +260,40 @@ func extractQUICSNI(payload []byte, srcPort uint16) string {
 	if info.TokenLen > 0 {
 		return ""
 	}
+
+	// Клиентский Initial (dstPort == 443)
+	if dstPort == 443 {
+		// Запоминаем SCID клиента → DCID клиента
+		if len(info.SCID) > 0 && len(info.DCID) > 0 {
+			clientDCIDsBySCID.Store(string(info.SCID), info.DCID)
+		}
+		plaintext, err := decryptInitial(info, false)
+		if err != nil {
+			return ""
+		}
+		return extractSNIFromCrypto(plaintext)
+	}
+
+	// Серверный Initial (srcPort == 443)
 	if srcPort == 443 {
-		return "" // серверные Initial не расшифровываем
+		// DCID серверного пакета = SCID клиента.
+		// Ищем клиентский DCID по этому SCID.
+		realDCID, ok := clientDCIDsBySCID.Load(string(info.DCID))
+		if !ok {
+			return ""
+		}
+		// Подменяем DCID на клиентский — server keys выводятся из него
+		savedDCID := info.DCID
+		info.DCID = realDCID.([]byte)
+		plaintext, err := decryptInitial(info, true)
+		info.DCID = savedDCID // восстанавливаем на случай отладки
+		if err != nil {
+			return ""
+		}
+		return extractSNIFromCrypto(plaintext)
 	}
-	plaintext, err := decryptInitial(info, false)
-	if err != nil {
-		return ""
-	}
-	return extractSNIFromCrypto(plaintext)
+
+	return ""
 }
 
 // extractSNIFromCrypto ищет CRYPTO frame (type 6) и внутри — TLS ClientHello.

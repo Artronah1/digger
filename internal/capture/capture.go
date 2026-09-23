@@ -233,7 +233,7 @@ func (c *Capture) process(pkt pcap.Packet) {
 
 	// QUIC-парсер: только UDP/443, только Initial
 	if proto == "UDP" && len(payload) > 0 && (srcPort == 443 || dstPort == 443) {
-		if sni := extractQUICSNI(payload, srcPort); sni != "" {
+		if sni := extractQUICSNI(payload, srcIP, dstIP, srcPort, dstPort); sni != "" {
 			key := FlowKey{
 				LocalIP:    srcIP,
 				LocalPort:  srcPort,
