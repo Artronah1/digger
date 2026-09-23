@@ -207,7 +207,9 @@ func (c *Capture) process(pkt pcap.Packet) {
 			RemotePort: dstPort,
 			Proto:      proto,
 		}
-		c.flows.AppendPayload(key, payload)
+		if sni := c.flows.AppendPayload(key, payload); sni != "" && c.anomaly != nil {
+			c.anomaly.MarkConnected(sni)
+		}
 	}
 
 	// DNS-парсер (UDP/53, UDP/5353, TCP/53)
@@ -219,13 +221,14 @@ func (c *Capture) process(pkt pcap.Packet) {
 				// Если это запрос (dstPort == 53) — проверяем аномалии
 				if dstPort == 53 && c.anomaly != nil {
 					if name, qtype, ok := parseDNSQuery(payload); ok {
-						// Утечка DNS?
 						if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
 							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
 						}
-						// Новый домен / хеш-подобный?
 						if flag := c.anomaly.CheckDomain(name, true); flag != "" {
 							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
+						}
+						if c.anomaly != nil {
+							c.anomaly.RecordDNSOnly(name)
 						}
 					}
 				}
@@ -258,6 +261,9 @@ func (c *Capture) process(pkt pcap.Packet) {
 				}
 			}
 			c.flows.SetSNI(key, sni)
+			if c.anomaly != nil {
+				c.anomaly.MarkConnected(sni)
+			}
 		}
 	}
 }

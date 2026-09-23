@@ -18,29 +18,28 @@ type AnomalyDetector struct {
 	historyPath  string
 	historyDirty bool
 
-	// Кэш для дедупликации вывода
 	reportedNew  map[string]time.Time
 	reportedHash map[string]time.Time
 	reportedLeak map[string]time.Time
 
-	// Записи для сводки
 	anomalies []AnomalyRecord
 
-	// Что уже показали (для дедупликации вывода)
 	printed map[string]bool
+
+	dnsOnlyDomains map[string]time.Time
+	dnsOnlyCounts  map[string]int
 }
 
 // AnomalyRecord — одна запись об аномалии.
 type AnomalyRecord struct {
 	Time    time.Time
-	Kind    string // NEW, HASH, DNS-LEAK
+	Kind    string
 	Domain  string
-	Detail  string // например, "→ 8.8.8.8" для DNS-LEAK
-	Process string // "icecat(70573)" или ""
+	Detail  string
+	Process string
 	SrcIP   string
 }
 
-// regex для хеш-подобного левого label
 var hashLabelRe = regexp.MustCompile(`^[a-f0-9]{16,}$|^[A-Za-z0-9_-]{20,}$`)
 
 func NewAnomalyDetector() *AnomalyDetector {
@@ -50,12 +49,14 @@ func NewAnomalyDetector() *AnomalyDetector {
 	path := filepath.Join(dir, "known_domains.txt")
 
 	ad := &AnomalyDetector{
-		knownDomains: make(map[string]bool),
-		historyPath:  path,
-		reportedNew:  make(map[string]time.Time),
-		reportedHash: make(map[string]time.Time),
-		reportedLeak: make(map[string]time.Time),
-		printed:      make(map[string]bool),
+		knownDomains:   make(map[string]bool),
+		historyPath:    path,
+		reportedNew:    make(map[string]time.Time),
+		reportedHash:   make(map[string]time.Time),
+		reportedLeak:   make(map[string]time.Time),
+		printed:        make(map[string]bool),
+		dnsOnlyDomains: make(map[string]time.Time),
+		dnsOnlyCounts:  make(map[string]int),
 	}
 	ad.loadHistory()
 	return ad
@@ -74,7 +75,6 @@ func (ad *AnomalyDetector) loadHistory() {
 	}
 }
 
-// SaveHistory сохраняет обновлённую историю на диск.
 func (ad *AnomalyDetector) SaveHistory() {
 	ad.mu.Lock()
 	defer ad.mu.Unlock()
@@ -89,13 +89,11 @@ func (ad *AnomalyDetector) SaveHistory() {
 	os.WriteFile(ad.historyPath, []byte(sb.String()), 0644)
 }
 
-// CheckDomain проверяет домен и возвращает метку аномалии (или "").
 func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 	if domain == "" {
 		return ""
 	}
 
-	// Пропускаем PTR-запросы
 	if strings.HasSuffix(domain, ".in-addr.arpa") ||
 		strings.HasSuffix(domain, ".ip6.arpa") {
 			return ""
@@ -107,7 +105,6 @@ func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 		now := time.Now()
 		var flags []string
 
-		// 1. Хеш-подобный поддомен
 		labels := strings.Split(domain, ".")
 		if len(labels) > 1 {
 			leftLabel := labels[0]
@@ -120,13 +117,11 @@ func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 							Time:   now,
 							Kind:   "HASH",
 							Domain: domain,
-							SrcIP:  "", // заполним позже
 						})
 					}
 			}
 		}
 
-		// 2. Новый домен (только для DNS-запросов)
 		if isDNS {
 			if !ad.knownDomains[domain] {
 				if _, reported := ad.reportedNew[domain]; !reported ||
@@ -137,7 +132,6 @@ func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 							Time:   now,
 							Kind:   "NEW",
 							Domain: domain,
-							SrcIP:  "",
 						})
 					}
 					ad.knownDomains[domain] = true
@@ -151,7 +145,6 @@ func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 		return strings.Join(flags, " ")
 }
 
-// CheckDNSLeak проверяет, идёт ли DNS-запрос к локальному резолверу.
 func (ad *AnomalyDetector) CheckDNSLeak(dstIP, domain string) string {
 	if isLANIP(dstIP) {
 		return ""
@@ -177,12 +170,66 @@ func (ad *AnomalyDetector) CheckDNSLeak(dstIP, domain string) string {
 		return fmt.Sprintf("⚠DNS-LEAK → %s", dstIP)
 }
 
-// SetProcessForDomain записывает процесс для недавней аномалии по домену.
-func (ad *AnomalyDetector) SetProcessForDomain(domain, process string) {
+// RecordDNSOnly запоминает DNS-запрос без последующего соединения.
+func (ad *AnomalyDetector) RecordDNSOnly(domain string) {
+	if domain == "" {
+		return
+	}
+	if strings.HasSuffix(domain, ".in-addr.arpa") ||
+		strings.HasSuffix(domain, ".ip6.arpa") {
+			return
+		}
+
+		ad.mu.Lock()
+		defer ad.mu.Unlock()
+
+		// Если домен уже был в истории — не считаем beaconing
+		if ad.knownDomains[domain] {
+			return
+		}
+
+		now := time.Now()
+		if _, ok := ad.dnsOnlyDomains[domain]; !ok {
+			ad.dnsOnlyDomains[domain] = now
+		}
+		ad.dnsOnlyCounts[domain]++
+
+		count := ad.dnsOnlyCounts[domain]
+		first := ad.dnsOnlyDomains[domain]
+		elapsed := now.Sub(first)
+
+		if count >= 3 && elapsed >= 30*time.Second {
+			key := "BEACON|" + domain
+			if ad.printed[key] {
+				return
+			}
+			ad.printed[key] = true
+
+			ad.anomalies = append(ad.anomalies, AnomalyRecord{
+				Time:   now,
+				Kind:   "BEACON",
+				Domain: domain,
+				Detail: fmt.Sprintf("(%d DNS за %s без соединений)", count, elapsed.Truncate(time.Second)),
+			})
+		}
+}
+
+// MarkConnected — если домен соединился, сбрасываем счётчик beaconing.
+func (ad *AnomalyDetector) MarkConnected(domain string) {
+	if domain == "" {
+		return
+	}
+
 	ad.mu.Lock()
 	defer ad.mu.Unlock()
 
-	// Обновляем последнюю аномалию с этим доменом
+	delete(ad.dnsOnlyDomains, domain)
+	delete(ad.dnsOnlyCounts, domain)
+}
+
+func (ad *AnomalyDetector) SetProcessForDomain(domain, process string) {
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
 	for i := len(ad.anomalies) - 1; i >= 0; i-- {
 		if ad.anomalies[i].Domain == domain && ad.anomalies[i].Process == "" {
 			ad.anomalies[i].Process = process
@@ -191,7 +238,6 @@ func (ad *AnomalyDetector) SetProcessForDomain(domain, process string) {
 	}
 }
 
-// CollectAnomalies возвращает записи за последние N минут.
 func (ad *AnomalyDetector) CollectAnomalies(window time.Duration) []AnomalyRecord {
 	ad.mu.Lock()
 	defer ad.mu.Unlock()
@@ -209,8 +255,6 @@ func (ad *AnomalyDetector) CollectAnomalies(window time.Duration) []AnomalyRecor
 	return out
 }
 
-// PrintAnomalies выводит сводку подозрительного.
-// Печатает только те записи, которые ещё не выводились.
 func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 	records := ad.CollectAnomalies(window)
 	if len(records) == 0 {
@@ -220,7 +264,6 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 	ad.mu.Lock()
 	defer ad.mu.Unlock()
 
-	// Фильтр — только новые
 	newRecords := make([]AnomalyRecord, 0)
 	for _, a := range records {
 		key := a.Kind + "|" + a.Domain + "|" + a.Detail
@@ -247,6 +290,8 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 				kind = "⚠HASH"
 			case "DNS-LEAK":
 				kind = "⚠LEAK"
+			case "BEACON":
+				kind = "⚠BEACON"
 			default:
 				kind = a.Kind
 		}
@@ -261,7 +306,7 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 			detail = " " + a.Detail
 		}
 
-		fmt.Printf("[%s] %-7s %-40s %s%s\n",
+		fmt.Printf("[%s] %-8s %-40s %s%s\n",
 			   ts, kind, truncate(a.Domain, 40), proc, detail)
 	}
 	fmt.Println()
