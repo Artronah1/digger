@@ -18,6 +18,7 @@ type Capture struct {
 	flows      *FlowTable
 	dnsTable   *DNSTable
 	dnsMapping *DNSMapping
+	anomaly    *AnomalyDetector
 	localIPs   map[string]bool
 	profileSNI string
 	routerMode bool
@@ -47,6 +48,7 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		flows:      NewFlowTable(),
 		dnsTable:   NewDNSTable(),
 		dnsMapping: NewDNSMapping(),
+		anomaly:    NewAnomalyDetector(),
 		localIPs:   localIPs,
 	}, nil
 }
@@ -76,6 +78,9 @@ func (c *Capture) Run() {
 				c.dnsTable.Print()
 				printAttribution(c.flows.Snapshot(), c.dnsMapping)
 				c.flows.PrintProfile(c.profileSNI)
+				if c.anomaly != nil {
+					c.anomaly.SaveHistory()
+				}
 				return
 			case <-enrichTicker.C:
 				c.flows.Enrich()
@@ -203,8 +208,23 @@ func (c *Capture) process(pkt pcap.Packet) {
 			(proto == "TCP" && (srcPort == 53 || dstPort == 53)) {
 				c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
 
+				// Если это запрос (dstPort == 53) — проверяем аномалии
+				if dstPort == 53 && c.anomaly != nil {
+					// Утечка DNS?
+					if leak := c.anomaly.CheckDNSLeak(dstIP); leak != "" {
+						if name, _, ok := parseDNSQuery(payload); ok {
+							c.dnsTable.SetFlags(name, "A", srcIP, dstIP, leak)
+						}
+					}
+					// Новый домен / хеш-подобный?
+					if name, qtype, ok := parseDNSQuery(payload); ok {
+						if flag := c.anomaly.CheckDomain(name, true); flag != "" {
+							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
+						}
+					}
+				}
+
 				// Если это ответ — строим маппинг name → IP
-				// Ответ идёт с srcPort == 53 (от сервера к клиенту)
 				if srcPort == 53 || srcPort == 5353 {
 					c.dnsMapping.Update(payload)
 				}

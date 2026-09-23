@@ -20,7 +20,7 @@ type DNSQuery struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Count     uint64
-
+	Flags	  string // метка аномалии
 	// Для дедупликации retry'ев
 	lastCounted time.Time
 }
@@ -36,6 +36,22 @@ func NewDNSTable() *DNSTable {
 	return &DNSTable{
 		queries: make(map[string]*DNSQuery),
 		maxAge:  5 * time.Minute, // по умолчанию — показываем записи за 5 минут
+	}
+}
+
+// SetFlags устанавливает метку аномалии для запроса.
+func (dt *DNSTable) SetFlags(name, qtype, srcIP, dstIP, flags string) {
+	key := name + "|" + qtype + "|" + srcIP + "|" + dstIP + "|udp/53"
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	if q, ok := dt.queries[key]; ok {
+		if q.Flags == "" {
+			q.Flags = flags
+		} else if !strings.Contains(q.Flags, flags) {
+			q.Flags += " " + flags
+		}
 	}
 }
 
@@ -163,19 +179,20 @@ func (dt *DNSTable) Print() {
 		fmt.Printf("⚠  обнаружены запросы к внешним DNS: %d\n", externalCount)
 	}
 
-	fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5s %s\n",
-		   "SRC", "NAME", "QTYPE", "VIA", "TO", "COUNT", "AGE")
+	fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5s %-5s %s\n",
+		   "SRC", "NAME", "QTYPE", "VIA", "TO", "COUNT", "AGE", "FLAGS")
 
 	for _, q := range queries {
 		age := time.Since(q.FirstSeen).Truncate(time.Second)
-		fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5d %s\n",
+		fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5d %-5s %s\n",
 			   truncate(q.SrcIP, 18),
 			   truncate(q.Name, 40),
 			   q.QType,
 	     q.Transport,
 	     q.DstIP,
 	     q.Count,
-	     age.String())
+	     age.String(),
+			   q.Flags)
 	}
 	fmt.Println()
 }

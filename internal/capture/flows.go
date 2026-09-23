@@ -359,6 +359,11 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 				    for i := range flows {
 					    f := &flows[i]
 
+					    // Пропускаем LAN-трафик (к локальным адресам) — это не интересно для аудита
+					    if isLANIP(f.Key.RemoteIP) {
+						    continue
+					    }
+
 					    label := f.SNI
 					    if label == "" {
 						    label = f.Hostname
