@@ -154,6 +154,7 @@ func (c *Capture) printAllJSON() {
 	c.printFlowsJSON()
 	c.printDNSJSON()
 	c.printAttributionJSON()
+	c.printProxySuspicionsJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
@@ -306,6 +307,47 @@ func (c *Capture) printAttributionJSON() {
 			Status:     status,
 			Reason:     reason,
 			AgeSec:     int64(a.Age.Seconds()),
+		}
+		printJSON(ev)
+	}
+}
+
+// ProxySuspicionEvent — поток, похожий на прокси.
+type ProxySuspicionEvent struct {
+	Event
+
+	Cycle      int    `json:"cycle"`
+	Local      string `json:"local"`
+	Remote     string `json:"remote"`
+	SNI        string `json:"sni,omitempty"`
+	Process    string `json:"process,omitempty"`
+	Reason     string `json:"reason"`
+	Confidence string `json:"confidence"`
+	AgeSec     int64  `json:"age_sec"`
+}
+
+// printProxySuspicionsJSON печатает подозрения на прокси.
+func (c *Capture) printProxySuspicionsJSON() {
+	sus := BuildProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
+	for _, s := range sus {
+		conf := "heuristic"
+		switch {
+			case strings.Contains(s.Reason, "процесс-прокси"):
+				conf = "process"
+			case strings.Contains(s.Reason, "прокси-фронт"):
+				conf = "dns-mismatch"
+		}
+
+		ev := ProxySuspicionEvent{
+			Event:      newEvent("proxy_suspicion"),
+			Cycle:      c.printCycle,
+			Local:      fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort),
+			Remote:     fmt.Sprintf("%s:%d", s.RemoteIP, s.RemotePort),
+			SNI:        s.SNI,
+			Process:    s.Process,
+			Reason:     s.Reason,
+			Confidence: conf,
+			AgeSec:     int64(s.Age.Seconds()),
 		}
 		printJSON(ev)
 	}
