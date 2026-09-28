@@ -20,7 +20,7 @@ type DNSQuery struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Count     uint64
-	Flags	  string // метка аномалии
+	Flags     string // метка аномалии
 	// Для дедупликации retry'ев
 	lastCounted time.Time
 }
@@ -80,16 +80,16 @@ func (dt *DNSTable) Update(payload []byte, srcIP, dstIP string, srcPort, dstPort
 
 	transport := proto
 	switch {
-		case proto == "UDP" && srcPort == 5353:
-			transport = "mdns"
-		case proto == "UDP" && dstPort == 5353:
-			transport = "mdns"
-		case proto == "UDP" && dstPort == 53:
-			transport = "udp/53"
-		case proto == "UDP":
-			transport = fmt.Sprintf("udp/%d", dstPort)
-		case proto == "TCP" && dstPort == 53:
-			transport = "tcp/53"
+	case proto == "UDP" && srcPort == 5353:
+		transport = "mdns"
+	case proto == "UDP" && dstPort == 5353:
+		transport = "mdns"
+	case proto == "UDP" && dstPort == 53:
+		transport = "udp/53"
+	case proto == "UDP":
+		transport = fmt.Sprintf("udp/%d", dstPort)
+	case proto == "TCP" && dstPort == 53:
+		transport = "tcp/53"
 	}
 
 	key := name + "|" + qtype + "|" + srcIP + "|" + dstIP + "|" + transport
@@ -191,19 +191,19 @@ func (dt *DNSTable) Print() {
 	}
 
 	fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5s %-5s %s\n",
-		   "SRC", "NAME", "QTYPE", "VIA", "TO", "COUNT", "AGE", "FLAGS")
+		"SRC", "NAME", "QTYPE", "VIA", "TO", "COUNT", "AGE", "FLAGS")
 
 	for _, q := range queries {
 		age := time.Since(q.FirstSeen).Truncate(time.Second)
 		fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5d %-5s %s\n",
-			   truncate(q.SrcIP, 18),
-			   truncate(q.Name, 40),
-			   q.QType,
-	     q.Transport,
-	     q.DstIP,
-	     q.Count,
-	     age.String(),
-			   q.Flags)
+			truncate(q.SrcIP, 18),
+			truncate(q.Name, 40),
+			q.QType,
+			q.Transport,
+			q.DstIP,
+			q.Count,
+			age.String(),
+			q.Flags)
 	}
 	fmt.Println()
 }
@@ -265,38 +265,38 @@ func parseDNSQuery(payload []byte) (string, string, bool) {
 // dnsTypeString возвращает человекочитаемое имя типа DNS-записи.
 func dnsTypeString(t uint16) string {
 	switch t {
-		case 1:
-			return "A"
-		case 2:
-			return "NS"
-		case 5:
-			return "CNAME"
-		case 6:
-			return "SOA"
-		case 12:
-			return "PTR"
-		case 15:
-			return "MX"
-		case 16:
-			return "TXT"
-		case 28:
-			return "AAAA"
-		case 33:
-			return "SRV"
-		case 43:
-			return "DS"
-		case 46:
-			return "RRSIG"
-		case 47:
-			return "NSEC"
-		case 48:
-			return "DNSKEY"
-		case 65:
-			return "HTTPS"
-		case 255:
-			return "ANY"
-		default:
-			return fmt.Sprintf("T%d", t)
+	case 1:
+		return "A"
+	case 2:
+		return "NS"
+	case 5:
+		return "CNAME"
+	case 6:
+		return "SOA"
+	case 12:
+		return "PTR"
+	case 15:
+		return "MX"
+	case 16:
+		return "TXT"
+	case 28:
+		return "AAAA"
+	case 33:
+		return "SRV"
+	case 43:
+		return "DS"
+	case 46:
+		return "RRSIG"
+	case 47:
+		return "NSEC"
+	case 48:
+		return "DNSKEY"
+	case 65:
+		return "HTTPS"
+	case 255:
+		return "ANY"
+	default:
+		return fmt.Sprintf("T%d", t)
 	}
 }
 
@@ -385,16 +385,16 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 		}
 
 		switch rtype {
-			case 1: // A
-				if rdlength == 4 {
-					ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
-								      payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
-				}
-			case 28: // AAAA
-				if rdlength == 16 {
-					ip := net.IP(payload[pos : pos+16])
-					ips = append(ips, ip.String())
-				}
+		case 1: // A
+			if rdlength == 4 {
+				ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
+					payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
+			}
+		case 28: // AAAA
+			if rdlength == 16 {
+				ip := net.IP(payload[pos : pos+16])
+				ips = append(ips, ip.String())
+			}
 		}
 
 		pos += rdlength
@@ -412,33 +412,33 @@ func isPrivateIP(ip string) bool {
 		strings.HasPrefix(ip, "192.168.") ||
 		strings.HasPrefix(ip, "127.") ||
 		strings.HasPrefix(ip, "169.254.") {
-			return true
-		}
-		// 172.16.0.0/12
-		if strings.HasPrefix(ip, "172.") {
-			parts := strings.Split(ip, ".")
-			if len(parts) == 4 {
-				// второй октет 16..31
-				switch parts[1] {
-					case "16", "17", "18", "19", "20", "21", "22", "23",
-					"24", "25", "26", "27", "28", "29", "30", "31":
-					return true
-				}
+		return true
+	}
+	// 172.16.0.0/12
+	if strings.HasPrefix(ip, "172.") {
+		parts := strings.Split(ip, ".")
+		if len(parts) == 4 {
+			// второй октет 16..31
+			switch parts[1] {
+			case "16", "17", "18", "19", "20", "21", "22", "23",
+				"24", "25", "26", "27", "28", "29", "30", "31":
+				return true
 			}
 		}
-		// IPv6 link-local
-		if strings.HasPrefix(ip, "fe80:") || strings.HasPrefix(ip, "fc") || strings.HasPrefix(ip, "fd") {
-			return true
-		}
-		return false
+	}
+	// IPv6 link-local
+	if strings.HasPrefix(ip, "fe80:") || strings.HasPrefix(ip, "fc") || strings.HasPrefix(ip, "fd") {
+		return true
+	}
+	return false
 }
 
 // DNSMapping — хранилище связей name → IP и IP → name.
 type DNSMapping struct {
-	mu           sync.RWMutex
-	nameToIPs    map[string]map[string]time.Time // name -> (IP -> lastSeen)
-	ipToNames    map[string]map[string]time.Time // IP -> (name -> lastSeen)
-	maxAge       time.Duration
+	mu        sync.RWMutex
+	nameToIPs map[string]map[string]time.Time // name -> (IP -> lastSeen)
+	ipToNames map[string]map[string]time.Time // IP -> (name -> lastSeen)
+	maxAge    time.Duration
 }
 
 func NewDNSMapping() *DNSMapping {
@@ -517,4 +517,11 @@ func (m *DNSMapping) Update(payload []byte) {
 	for _, ip := range ips {
 		m.Add(name, ip)
 	}
+}
+
+// Len возвращает число известных пар name → IP.
+func (m *DNSMapping) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.ipToNames)
 }

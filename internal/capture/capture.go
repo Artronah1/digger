@@ -23,6 +23,8 @@ type Capture struct {
 	localIPs   map[string]bool
 	profileSNI string
 	routerMode bool
+	groupBy    string // "app" | "device" | ""
+	appFilter  string // фильтр по имени приложения
 }
 
 func New(iface string, snaplen int, verbose bool) (*Capture, error) {
@@ -58,14 +60,16 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	}, nil
 }
 
-func (c *Capture) SetMinPkts(n int)      { c.flows.SetMinPkts(n) }
-func (c *Capture) SetHideIdle(v bool)    { c.flows.SetHideIdle(v) }
-func (c *Capture) SetActiveOnly(n int)   { c.flows.SetActiveOnly(n) }
-func (c *Capture) SetProfile(sni string) { c.profileSNI = sni }
-func (c *Capture) SetDNSAge(d time.Duration) { c.dnsTable.SetMaxAge(d) }
-func (c *Capture) SetShowPTR(v bool) { c.dnsTable.SetShowPTR(v) }
+func (c *Capture) SetMinPkts(n int)            { c.flows.SetMinPkts(n) }
+func (c *Capture) SetHideIdle(v bool)          { c.flows.SetHideIdle(v) }
+func (c *Capture) SetActiveOnly(n int)         { c.flows.SetActiveOnly(n) }
+func (c *Capture) SetProfile(sni string)       { c.profileSNI = sni }
+func (c *Capture) SetDNSAge(d time.Duration)   { c.dnsTable.SetMaxAge(d) }
+func (c *Capture) SetShowPTR(v bool)           { c.dnsTable.SetShowPTR(v) }
+func (c *Capture) SetGroupBy(s string)         { c.groupBy = s }
+func (c *Capture) SetAppFilter(s string)       { c.appFilter = s; c.flows.SetAppFilter(s) }
 func (c *Capture) SetFilter(expr string) error { return c.handle.SetBPFFilter(expr) }
-func (c *Capture) SetRouterMode(v bool) { c.routerMode = v }
+func (c *Capture) SetRouterMode(v bool)        { c.routerMode = v }
 
 func (c *Capture) Run() {
 	packets := c.handle.Listen()
@@ -78,30 +82,40 @@ func (c *Capture) Run() {
 
 	for {
 		select {
-			case <-c.stopCh:
-				c.flows.Enrich()
+		case <-c.stopCh:
+			c.flows.Enrich()
+			if c.groupBy == "app" || c.groupBy == "device" {
+				c.flows.PrintApps()
+			} else {
 				c.flows.Print()
-				c.dnsTable.Print()
-				printAttribution(c.flows.Snapshot(), c.dnsMapping)
-				c.printAnomalies()
-				c.flows.PrintProfile(c.profileSNI)
-				if c.anomaly != nil {
-					c.anomaly.SaveHistory()
-				}
+			}
+			c.dnsTable.Print()
+			printAttribution(c.flows.Snapshot(), c.dnsMapping)
+			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
+			c.printAnomalies()
+			c.flows.PrintProfile(c.profileSNI)
+			if c.anomaly != nil {
+				c.anomaly.SaveHistory()
+			}
+			return
+		case <-enrichTicker.C:
+			c.flows.Enrich()
+		case <-printTicker.C:
+			if c.groupBy == "app" || c.groupBy == "device" {
+				c.flows.PrintApps()
+			} else {
+				c.flows.Print()
+			}
+			c.dnsTable.Print()
+			printAttribution(c.flows.Snapshot(), c.dnsMapping)
+			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
+			c.printAnomalies()
+			c.flows.PrintProfile(c.profileSNI)
+		case pkt, ok := <-packets:
+			if !ok {
 				return
-			case <-enrichTicker.C:
-				c.flows.Enrich()
-			case <-printTicker.C:
-				c.flows.Print()
-				c.dnsTable.Print()
-				printAttribution(c.flows.Snapshot(), c.dnsMapping)
-				c.printAnomalies()
-				c.flows.PrintProfile(c.profileSNI)
-			case pkt, ok := <-packets:
-				if !ok {
-					return
-				}
-				c.process(pkt)
+			}
+			c.process(pkt)
 		}
 	}
 }
@@ -132,12 +146,12 @@ func (c *Capture) process(pkt pcap.Packet) {
 
 	var srcIP, dstIP string
 	switch ip := ipLayer.(type) {
-		case *layers.IPv4:
-			srcIP = ip.SrcIP.String()
-			dstIP = ip.DstIP.String()
-		case *layers.IPv6:
-			srcIP = ip.SrcIP.String()
-			dstIP = ip.DstIP.String()
+	case *layers.IPv4:
+		srcIP = ip.SrcIP.String()
+		dstIP = ip.DstIP.String()
+	case *layers.IPv6:
+		srcIP = ip.SrcIP.String()
+		dstIP = ip.DstIP.String()
 	}
 
 	proto := "OTHER"
@@ -179,18 +193,18 @@ func (c *Capture) process(pkt pcap.Packet) {
 		dstIsLAN := isLANIP(dstIP)
 
 		switch {
-			case srcIsLAN && !dstIsLAN:
-				// LAN-клиент → внешний мир = outbound
-				isOutbound = true
-			case !srcIsLAN && dstIsLAN:
-				// Внешний мир → LAN-клиент = inbound
-				isOutbound = false
-			case srcIsLAN && dstIsLAN:
-				// LAN ↔ LAN. Если src — не адрес роутера, это клиент → outbound
-				isOutbound = !c.localIPs[srcIP]
-			default:
-				// Ни то, ни другое (не должно случаться на br-lan)
-				isOutbound = false
+		case srcIsLAN && !dstIsLAN:
+			// LAN-клиент → внешний мир = outbound
+			isOutbound = true
+		case !srcIsLAN && dstIsLAN:
+			// Внешний мир → LAN-клиент = inbound
+			isOutbound = false
+		case srcIsLAN && dstIsLAN:
+			// LAN ↔ LAN. Если src — не адрес роутера, это клиент → outbound
+			isOutbound = !c.localIPs[srcIP]
+		default:
+			// Ни то, ни другое (не должно случаться на br-lan)
+			isOutbound = false
 		}
 	} else {
 		isOutbound = c.localIPs[srcIP]
@@ -216,28 +230,28 @@ func (c *Capture) process(pkt pcap.Packet) {
 	if len(payload) > 0 {
 		if (proto == "UDP" && (srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353)) ||
 			(proto == "TCP" && (srcPort == 53 || dstPort == 53)) {
-				c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
+			c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
 
-				// Если это запрос (dstPort == 53) — проверяем аномалии
-				if dstPort == 53 && c.anomaly != nil {
-					if name, qtype, ok := parseDNSQuery(payload); ok {
-						if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
-							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
-						}
-						if flag := c.anomaly.CheckDomain(name, true); flag != "" {
-							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
-						}
-						if c.anomaly != nil {
-							c.anomaly.RecordDNSOnly(name)
-						}
+			// Если это запрос (dstPort == 53) — проверяем аномалии
+			if dstPort == 53 && c.anomaly != nil {
+				if name, qtype, ok := parseDNSQuery(payload); ok {
+					if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
+						c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
+					}
+					if flag := c.anomaly.CheckDomain(name, true); flag != "" {
+						c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
+					}
+					if c.anomaly != nil {
+						c.anomaly.RecordDNSOnly(name)
 					}
 				}
-
-				// Если это ответ — строим маппинг name → IP
-				if srcPort == 53 || srcPort == 5353 {
-					c.dnsMapping.Update(payload)
-				}
 			}
+
+			// Если это ответ — строим маппинг name → IP
+			if srcPort == 53 || srcPort == 5353 {
+				c.dnsMapping.Update(payload)
+			}
+		}
 	}
 
 	// QUIC-парсер: только UDP/443, только Initial
@@ -264,6 +278,13 @@ func (c *Capture) process(pkt pcap.Packet) {
 			if c.anomaly != nil {
 				c.anomaly.MarkConnected(sni)
 			}
+		}
+	}
+
+	// VPN-детект: только для исходящих пакетов, только первый пакет потока
+	if isOutbound && len(payload) > 0 && (proto == "UDP" || proto == "TCP") {
+		if det := detectVPN(payload, srcIP, dstIP, srcPort, dstPort); det != nil {
+			c.flows.MarkVPN(srcIP, srcPort, dstIP, dstPort, proto, det)
 		}
 	}
 }
@@ -347,21 +368,21 @@ func (c *Capture) printAnomalies() {
 	c.anomaly.PrintAnomalies(5 * time.Minute)
 }
 
-	// isLANIP определяет, является ли IP локальным (RFC1918 или link-local).
-	func isLANIP(ip string) bool {
-		parsed := net.ParseIP(ip)
-		if parsed == nil {
-			return false
-		}
-		if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() {
-			return true
-		}
-		if parsed.IsPrivate() {
-			return true
-		}
-		// IPv6 ULA (fc00::/7)
-		if len(parsed) == net.IPv6len && (parsed[0]&0xfe) == 0xfc {
-			return true
-		}
+// isLANIP определяет, является ли IP локальным (RFC1918 или link-local).
+func isLANIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
 		return false
 	}
+	if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() {
+		return true
+	}
+	if parsed.IsPrivate() {
+		return true
+	}
+	// IPv6 ULA (fc00::/7)
+	if len(parsed) == net.IPv6len && (parsed[0]&0xfe) == 0xfc {
+		return true
+	}
+	return false
+}
