@@ -155,6 +155,8 @@ func (c *Capture) printAllJSON() {
 	c.printDNSJSON()
 	c.printAttributionJSON()
 	c.printProxySuspicionsJSON()
+	c.printProxyProcessesJSON()
+	c.printAnomaliesJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
@@ -332,10 +334,10 @@ func (c *Capture) printProxySuspicionsJSON() {
 	for _, s := range sus {
 		conf := "heuristic"
 		switch {
-			case strings.Contains(s.Reason, "процесс-прокси"):
-				conf = "process"
-			case strings.Contains(s.Reason, "прокси-фронт"):
-				conf = "dns-mismatch"
+		case strings.Contains(s.Reason, "процесс-прокси"):
+			conf = "process"
+		case strings.Contains(s.Reason, "прокси-фронт"):
+			conf = "dns-mismatch"
 		}
 
 		ev := ProxySuspicionEvent{
@@ -348,6 +350,73 @@ func (c *Capture) printProxySuspicionsJSON() {
 			Reason:     s.Reason,
 			Confidence: conf,
 			AgeSec:     int64(s.Age.Seconds()),
+		}
+		printJSON(ev)
+	}
+}
+
+// ProxyProcessEvent — агрегат по процессу-прокси.
+type ProxyProcessEvent struct {
+	Event
+
+	Cycle     int    `json:"cycle"`
+	Process   string `json:"process"`
+	Conns     int    `json:"conns"`
+	BytesOut  uint64 `json:"bytes_out"`
+	BytesIn   uint64 `json:"bytes_in"`
+	RemoteIPs int    `json:"remote_ips"`
+	AgeSec    int64  `json:"age_sec"`
+}
+
+// printProxyProcessesJSON печатает агрегат по процессам-прокси.
+func (c *Capture) printProxyProcessesJSON() {
+	procs := BuildProxyProcesses(c.flows.Snapshot())
+	now := time.Now()
+	for _, p := range procs {
+		ev := ProxyProcessEvent{
+			Event:     newEvent("proxy_process"),
+			Cycle:     c.printCycle,
+			Process:   p.Process,
+			Conns:     p.Conns,
+			BytesOut:  p.BytesOut,
+			BytesIn:   p.BytesIn,
+			RemoteIPs: p.RemoteIPs,
+			AgeSec:    int64(now.Sub(p.FirstSeen).Seconds()),
+		}
+		printJSON(ev)
+	}
+}
+
+// AnomalyEvent — аномалия (⚡NEW, ⚠HASH, ⚠BEACON, ⚠PROXY, ⚠DNS-LEAK).
+type AnomalyEvent struct {
+	Event
+
+	Cycle   int    `json:"cycle"`
+	Kind    string `json:"kind"` // NEW, HASH, BEACON, PROXY, DNS-LEAK
+	Domain  string `json:"domain,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	Process string `json:"process,omitempty"`
+	AgeSec  int64  `json:"age_sec"`
+}
+
+// printAnomaliesJSON печатает аномалии.
+func (c *Capture) printAnomaliesJSON() {
+	if c.anomaly == nil {
+		return
+	}
+
+	records := c.anomaly.CollectAnomalies(5 * time.Minute)
+	now := time.Now()
+
+	for _, a := range records {
+		ev := AnomalyEvent{
+			Event:   newEvent("anomaly"),
+			Cycle:   c.printCycle,
+			Kind:    a.Kind,
+			Domain:  a.Domain,
+			Detail:  a.Detail,
+			Process: a.Process,
+			AgeSec:  int64(now.Sub(a.Time).Seconds()),
 		}
 		printJSON(ev)
 	}
