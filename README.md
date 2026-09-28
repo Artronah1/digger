@@ -24,6 +24,7 @@
 - **Детектор прокси/VPN-клиентов** — находит потоки, похожие на прокси (mihomo, xray, sing-box, v2ray, trojan и др.) по имени процесса и резолву SNI.
 - **GeoIP-проверка** — `GeoLite2-Country` для определения страны IP (используется, чтобы не путать российские IP с прокси).
 - **Фильтры шума** (`-min-pkts`, `-hide-idle`, `-active-only`, `-dns-age`).
+- **JSONL output** (`-output json`) — восемь типов событий: `snapshot`, `health`, `flow`, `dns`, `attribution`, `proxy_suspicion`, `proxy_process`, `anomaly`. Схема `schema: 1`.
 
 ## Что показывает
 
@@ -35,6 +36,8 @@
 - **Хеш-подобные поддомены** (`⚠HASH`) — типичные трекеры (`b5b249a2d117...vip1...`).
 - **Beaconing** (`⚠BEACON`) — домен запрашивается регулярно, но соединения нет.
 - **Прокси-трафик** (`⚠PROXY`) — потоки, где SNI не резолвится в удалённый IP, или процесс — известный прокси-клиент, а IP не российский.
+- **Capture Health** — счётчики `received`/`processed`/`truncated`/`decode errors`. Флаг `quality: complete/incomplete`. Под нагрузкой `received == processed` — ноль потерь.
+- **`RECON`** — насколько полно реконструирован payload: `✓` (complete), `⚠part` (partial), `⚠gap` (gap), `?` (unknown). Видно, где SNI **точно** извлекли, а где ClientHello не видели.
 
 ## Флаги аномалий
 
@@ -44,7 +47,7 @@
 | `⚠HASH` | DNS-таблица | левый label ≥16 символов hex/base64 — трекер или session ID |
 | `⚠DNS-LEAK` | DNS-таблица | DNS-запрос к серверу вне LAN (например, `8.8.8.8`) |
 | `⚠BEACON` | Раздел «Подозрительное» | домен запрашивается ≥3 раз за ≥30 сек **без соединений** |
-| `⚠PROXY` | Раздел «Похоже на прокси/VPN-клиент» | SNI не резолвится в IP или процесс-прокси на не-российский IP |
+| `⚠PROXY` | Раздел «Похоже на прокси/VPN-клиент» + «Подозрительное» | SNI не резолвится в IP (**прокси-фронт**) или процесс-прокси на не-российский IP |
 
 История доменов сохраняется в `~/.digger/known_domains.txt`. Удалить — `rm ~/.digger/known_domains.txt`.
 
@@ -84,6 +87,7 @@
 - **QUIC Initial — не секрет** (RFC 9001, ключи выводятся из DCID и публичной соли). SNI из него может прочитать любой DPI.
 - **Не блокирует прокси.** Только показывает, что трафик идёт через прокси-клиент.
 - **Не определяет «VPN это или нет» по содержимому.** Только по косвенным признакам: SNI, DNS, GeoIP, имя процесса.
+- **Не классифицирует** поток как «direct/proxy/vpn» автоматически — только показывает признаки.
 
 ## Сборка
 
@@ -197,6 +201,54 @@ APP                            CONNS  DOMAINS        OUT         IN   AGE
 | `-log FILE` | писать вывод в файл (одновременно в stdout) |
 | `-group-by app\|device` | группировать по приложениям или устройствам |
 | `-app NAME` | фильтр по имени приложения/устройства |
+| `-output text\|json` | формат вывода: текстовый (по умолчанию) или JSONL |
+
+## JSON output
+
+`-output json` печатает **JSONL** — по одному JSON-объекту на строку. Схема версионируется (`schema: 1`).
+
+Восемь типов событий:
+
+| `kind` | Что |
+|---|---|
+| `snapshot` | мета о запуске: iface, filter, snaplen, version, uptime |
+| `health` | счётчики Capture Health + quality |
+| `flow` | агрегированный поток: label, sni, process, recon, conns, bytes |
+| `dns` | DNS-запрос: name, qtype, src/dst, transport, count, flags |
+| `attribution` | связка DNS ↔ SNI ↔ IP: status (✓/~/⚠/✗/?), dns_names, reason |
+| `proxy_suspicion` | подозрение на прокси: reason, confidence (process / dns-mismatch / heuristic) |
+| `proxy_process` | агрегат по процессу-прокси: process, conns, bytes, remote_ips |
+| `anomaly` | аномалия: NEW / HASH / BEACON / PROXY / DNS-LEAK |
+
+Пример:
+
+```bash
+sudo ./digger -i eth0 -f "tcp port 443" -output json | jq -c 'select(.kind=="flow") | {label, process, recon, classification}'
+```
+
+```json
+{"label":"ws.chatgpt.com","process":"icecat(19007)","recon":"complete"}
+{"label":"172.64.148.235","process":"icecat(19007)","recon":"unknown"}
+```
+
+Запись в файл:
+
+```bash
+sudo ./digger -i eth0 -output json -log /tmp/audit.jsonl
+```
+
+Анализ:
+
+```bash
+# Все прокси-процессы
+jq 'select(.kind=="proxy_process")' /tmp/audit.jsonl
+
+# Потоки, где SNI не резолвится
+jq 'select(.kind=="proxy_suspicion" and .confidence=="dns-mismatch")' /tmp/audit.jsonl
+
+# Проверка, не терялись ли пакеты
+jq 'select(.kind=="health" and .quality=="incomplete")' /tmp/audit.jsonl
+```
 
 ### Что такое BPF-фильтр
 
