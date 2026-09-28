@@ -11,7 +11,7 @@ var (
 	geoipDB     *geoip2.Reader
 	geoipOnce   sync.Once
 	geoipErr    error
-	geoipDBPath = "/home/Kirill/digger/GeoLite2-Country.mmdb"
+	geoipDBPath = "GeoLite2-Country.mmdb"
 )
 
 func initGeoIP() error {

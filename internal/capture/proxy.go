@@ -54,9 +54,15 @@ func resolveSNI(sni string) []string {
 	}
 	sniCacheMu.Unlock()
 
-	ips, err := net.LookupHost(sni)
+	addrs, err := net.LookupIP(sni)
 	if err != nil {
-		ips = nil
+		addrs = nil
+	}
+	var ips []string
+	for _, a := range addrs {
+		if v4 := a.To4(); v4 != nil {
+			ips = append(ips, v4.String())
+		}
 	}
 
 	sniCacheMu.Lock()
