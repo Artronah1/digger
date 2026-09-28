@@ -1,5 +1,6 @@
 ![Release](https://img.shields.io/github/v/release/Artronah1/digger)
 ![License](https://img.shields.io/github/license/Artronah1/digger)
+![Go](https://img.shields.io/badge/Go-1.21+-blue)
 
 # digger
 
