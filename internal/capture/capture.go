@@ -91,7 +91,7 @@ func (c *Capture) Run() {
 			}
 			c.dnsTable.Print()
 			printAttribution(c.flows.Snapshot(), c.dnsMapping)
-			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
+			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
 			c.printAnomalies()
 			c.flows.PrintProfile(c.profileSNI)
 			if c.anomaly != nil {
@@ -101,6 +101,7 @@ func (c *Capture) Run() {
 		case <-enrichTicker.C:
 			c.flows.Enrich()
 		case <-printTicker.C:
+			c.flows.Enrich()
 			if c.groupBy == "app" || c.groupBy == "device" {
 				c.flows.PrintApps()
 			} else {
@@ -108,7 +109,7 @@ func (c *Capture) Run() {
 			}
 			c.dnsTable.Print()
 			printAttribution(c.flows.Snapshot(), c.dnsMapping)
-			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
+			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
 			c.printAnomalies()
 			c.flows.PrintProfile(c.profileSNI)
 		case pkt, ok := <-packets:

@@ -236,10 +236,17 @@ func printAttribution(flows []FlowStats, mapping *DNSMapping) {
 }
 
 // printProxySuspicions выводит потоки, похожие на прокси/VPN-клиент.
-func printProxySuspicions(flows []FlowStats, mapping *DNSMapping) {
+func printProxySuspicions(flows []FlowStats, mapping *DNSMapping, anomaly *AnomalyDetector) {
 	sus := BuildProxySuspicions(flows, mapping)
 	if len(sus) == 0 {
 		return
+	}
+
+	// Регистрируем в детекторе аномалий
+	if anomaly != nil {
+		for _, s := range sus {
+			anomaly.RecordProxy(s.SNI, s.RemoteIP, s.Process, s.Reason)
+		}
 	}
 
 	fmt.Printf("\n=== ⚠ Похоже на прокси/VPN-клиент (%d) ===\n", len(sus))

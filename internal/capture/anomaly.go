@@ -214,6 +214,30 @@ func (ad *AnomalyDetector) RecordDNSOnly(domain string) {
 	}
 }
 
+// RecordProxy регистрирует прокси-поток как аномалию.
+func (ad *AnomalyDetector) RecordProxy(sni, remoteIP, process, reason string) {
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
+
+	now := time.Now()
+	key := "PROXY|" + sni + "|" + remoteIP
+
+	// Не повторяем одну и ту же запись чаще, чем раз в 5 минут
+	if _, reported := ad.reportedNew[key]; reported &&
+		now.Sub(ad.reportedNew[key]) < 5*time.Minute {
+		return
+	}
+	ad.reportedNew[key] = now
+
+	ad.anomalies = append(ad.anomalies, AnomalyRecord{
+		Time:    now,
+		Kind:    "PROXY",
+		Domain:  sni,
+		Detail:  fmt.Sprintf("→ %s (%s)", remoteIP, reason),
+		Process: process,
+	})
+}
+
 // MarkConnected — если домен соединился, сбрасываем счётчик beaconing.
 func (ad *AnomalyDetector) MarkConnected(domain string) {
 	if domain == "" {
@@ -292,6 +316,8 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 			kind = "⚠LEAK"
 		case "BEACON":
 			kind = "⚠BEACON"
+		case "PROXY":
+			kind = "⚠PROXY"
 		default:
 			kind = a.Kind
 		}
