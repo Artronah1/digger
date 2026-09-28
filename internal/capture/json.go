@@ -153,6 +153,7 @@ func (c *Capture) printAllJSON() {
 	c.printHealthJSON()
 	c.printFlowsJSON()
 	c.printDNSJSON()
+	c.printAttributionJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
@@ -248,6 +249,63 @@ func (c *Capture) printDNSJSON() {
 			FirstSeen: q.FirstSeen.UTC().Format(time.RFC3339Nano),
 			LastSeen:  q.LastSeen.UTC().Format(time.RFC3339Nano),
 			Flags:     q.Flags,
+		}
+		printJSON(ev)
+	}
+}
+
+// AttributionEvent — одна связка DNS ↔ SNI ↔ IP.
+type AttributionEvent struct {
+	Event
+
+	Cycle      int      `json:"cycle"`
+	Local      string   `json:"local"`
+	RemoteIP   string   `json:"remote_ip"`
+	RemotePort uint16   `json:"remote_port"`
+	SNI        string   `json:"sni,omitempty"`
+	DNSNames   []string `json:"dns_names,omitempty"`
+	Status     string   `json:"status"` // "✓", "~", "?", "✗", "⚠"
+	Reason     string   `json:"reason,omitempty"`
+	AgeSec     int64    `json:"age_sec"`
+}
+
+// printAttributionJSON печатает связки DNS ↔ SNI ↔ IP.
+func (c *Capture) printAttributionJSON() {
+	attrs := BuildAttributions(c.flows.Snapshot(), c.dnsMapping)
+	for _, a := range attrs {
+		// Определяем статус и причину
+		status := "?"
+		reason := ""
+
+		switch {
+		case a.Matched:
+			status = "✓"
+			reason = "sni matches dns"
+		case a.Mismatch:
+			status = "⚠"
+			reason = "sni != dns"
+		case len(a.DNSNames) > 0:
+			status = "~"
+			reason = "dns only, no sni"
+		case a.SNI != "":
+			status = "✗"
+			reason = "sni only, no dns"
+		default:
+			status = "?"
+			reason = "no sni, no dns"
+		}
+
+		ev := AttributionEvent{
+			Event:      newEvent("attribution"),
+			Cycle:      c.printCycle,
+			Local:      fmt.Sprintf("%s:%d", a.LocalIP, a.LocalPort),
+			RemoteIP:   a.RemoteIP,
+			RemotePort: a.RemotePort,
+			SNI:        a.SNI,
+			DNSNames:   a.DNSNames,
+			Status:     status,
+			Reason:     reason,
+			AgeSec:     int64(a.Age.Seconds()),
 		}
 		printJSON(ev)
 	}
