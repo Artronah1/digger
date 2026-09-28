@@ -82,3 +82,54 @@ func sniResolvesToIP(sni, ip string) bool {
 	}
 	return false
 }
+
+// ResolveResult — результат проверки SNI ↔ IP.
+type ResolveResult struct {
+	Matches     bool
+	Reason      string // "matched" | "no-observation" | "different-ip" | "not-resolved" | "no-mapping"
+	ObservedIPs []string
+}
+
+// resolveSNIAt проверяет, был ли SNI актуален для IP на момент at.
+func resolveSNIAt(sni, ip string, at time.Time, mapping *DNSMapping) ResolveResult {
+	if mapping == nil {
+		ips := resolveSNI(sni)
+		if len(ips) == 0 {
+			return ResolveResult{Reason: "not-resolved"}
+		}
+		for _, r := range ips {
+			if r == ip {
+				return ResolveResult{Matches: true, Reason: "matched", ObservedIPs: ips}
+			}
+		}
+		return ResolveResult{Reason: "different-ip", ObservedIPs: ips}
+	}
+
+	// 1. Проверяем наблюдения в момент at
+	names := mapping.NamesForIPAt(ip, at)
+	for _, n := range names {
+		if n == sni {
+			return ResolveResult{Matches: true, Reason: "matched"}
+		}
+	}
+
+	// 2. Наблюдений нет — резолвим сами
+	ips := resolveSNI(sni)
+	if len(ips) == 0 {
+		return ResolveResult{Reason: "not-resolved"}
+	}
+
+	// 3. Резолвится — но в другой IP?
+	for _, r := range ips {
+		if r == ip {
+			return ResolveResult{Matches: true, Reason: "matched", ObservedIPs: ips}
+		}
+	}
+
+	// 4. Резолвится, но в другой IP — CDN-балансировка, не прокси
+	return ResolveResult{
+		Matches:     false,
+		Reason:      "different-ip",
+		ObservedIPs: ips,
+	}
+}

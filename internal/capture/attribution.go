@@ -106,26 +106,25 @@ func BuildProxySuspicions(flows []FlowStats, mapping *DNSMapping) []ProxySuspici
 		}
 
 		proc := f.Comm
-		dnsNames := mapping.NamesForIP(f.Key.RemoteIP)
 
 		var reason string
 
 		if f.SNI != "" {
-			if len(dnsNames) == 0 {
-				// DNS не захвачен — резолвим сами.
-				if !sniResolvesToIP(f.SNI, f.Key.RemoteIP) {
-					reason = "SNI не резолвится в этот IP — прокси?"
-				}
-			} else {
-				matched := false
-				for _, n := range dnsNames {
-					if n == f.SNI {
-						matched = true
-						break
-					}
-				}
-				if !matched {
-					reason = "SNI ≠ DNS — подмена/прикрытие"
+			res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, mapping)
+			if !res.Matches {
+				switch res.Reason {
+				case "not-resolved":
+					// Домен вообще не резолвится — сильный признак прокси-фронта
+					reason = "SNI не резолвится — прокси-фронт?"
+				case "no-observation":
+					// Наблюдений нет, но и резолва нет
+					reason = "SNI без DNS-наблюдения — возможно прокси?"
+				case "no-mapping":
+					// Маппинг пуст — не можем проверить
+					reason = ""
+				case "different-ip":
+					// Резолвится в другой IP — CDN-балансировка, не прокси
+					reason = ""
 				}
 			}
 		}

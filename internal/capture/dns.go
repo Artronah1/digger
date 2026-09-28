@@ -309,7 +309,7 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 
 	flags := binary.BigEndian.Uint16(payload[2:4])
 	if flags&0x8000 == 0 {
-		return "", nil, false // это не ответ
+		return "", nil, false
 	}
 
 	qdcount := binary.BigEndian.Uint16(payload[4:6])
@@ -318,7 +318,6 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 		return "", nil, false
 	}
 
-	// Пропускаем QNAME
 	pos := 12
 	var qname strings.Builder
 	for pos < len(payload) {
@@ -328,7 +327,6 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 			break
 		}
 		if labelLen&0xC0 != 0 {
-			// Компрессия в вопросе (редко, но бывает)
 			pos += 2
 			break
 		}
@@ -343,7 +341,6 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 		pos += labelLen
 	}
 
-	// QTYPE + QCLASS
 	pos += 4
 
 	name := qname.String()
@@ -353,14 +350,12 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 
 	var ips []string
 
-	// Парсим ответы
 	for i := 0; i < int(ancount); i++ {
-		// NAME в ответе — может быть сжатие
 		if pos >= len(payload) {
 			break
 		}
 		if payload[pos]&0xC0 == 0xC0 {
-			pos += 2 // compressed name
+			pos += 2
 		} else {
 			for pos < len(payload) && payload[pos] != 0 {
 				labelLen := int(payload[pos])
@@ -370,7 +365,7 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 				}
 				pos += 1 + labelLen
 			}
-			pos++ // null byte
+			pos++
 		}
 
 		if pos+10 > len(payload) {
@@ -385,12 +380,12 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 		}
 
 		switch rtype {
-		case 1: // A
+		case 1:
 			if rdlength == 4 {
 				ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
 					payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
 			}
-		case 28: // AAAA
+		case 28:
 			if rdlength == 16 {
 				ip := net.IP(payload[pos : pos+16])
 				ips = append(ips, ip.String())
@@ -404,6 +399,114 @@ func parseDNSResponse(payload []byte) (string, []string, bool) {
 		return "", nil, false
 	}
 	return name, ips, true
+}
+
+// parseDNSResponseTTL — как parseDNSResponse, но возвращает минимальный TTL.
+func parseDNSResponseTTL(payload []byte) (string, []string, uint32, bool) {
+	if len(payload) < 12 {
+		return "", nil, 0, false
+	}
+
+	flags := binary.BigEndian.Uint16(payload[2:4])
+	if flags&0x8000 == 0 {
+		return "", nil, 0, false
+	}
+
+	qdcount := binary.BigEndian.Uint16(payload[4:6])
+	ancount := binary.BigEndian.Uint16(payload[6:8])
+	if qdcount == 0 || ancount == 0 {
+		return "", nil, 0, false
+	}
+
+	pos := 12
+	var qname strings.Builder
+	for pos < len(payload) {
+		labelLen := int(payload[pos])
+		if labelLen == 0 {
+			pos++
+			break
+		}
+		if labelLen&0xC0 != 0 {
+			pos += 2
+			break
+		}
+		pos++
+		if pos+labelLen > len(payload) {
+			return "", nil, 0, false
+		}
+		if qname.Len() > 0 {
+			qname.WriteByte('.')
+		}
+		qname.Write(payload[pos : pos+labelLen])
+		pos += labelLen
+	}
+
+	pos += 4
+
+	name := qname.String()
+	if name == "" {
+		return "", nil, 0, false
+	}
+
+	var ips []string
+	var minTTL uint32
+
+	for i := 0; i < int(ancount); i++ {
+		if pos >= len(payload) {
+			break
+		}
+		if payload[pos]&0xC0 == 0xC0 {
+			pos += 2
+		} else {
+			for pos < len(payload) && payload[pos] != 0 {
+				labelLen := int(payload[pos])
+				if labelLen&0xC0 != 0 {
+					pos += 2
+					break
+				}
+				pos += 1 + labelLen
+			}
+			pos++
+		}
+
+		if pos+10 > len(payload) {
+			break
+		}
+		rtype := binary.BigEndian.Uint16(payload[pos : pos+2])
+		ttl := binary.BigEndian.Uint32(payload[pos+4 : pos+8])
+		rdlength := int(binary.BigEndian.Uint16(payload[pos+8 : pos+10]))
+		pos += 10
+
+		if pos+rdlength > len(payload) {
+			break
+		}
+
+		switch rtype {
+		case 1: // A
+			if rdlength == 4 {
+				ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
+					payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
+				if minTTL == 0 || ttl < minTTL {
+					minTTL = ttl
+				}
+			}
+		case 28: // AAAA
+			if rdlength == 16 {
+				ip := net.IP(payload[pos : pos+16])
+				ips = append(ips, ip.String())
+				if minTTL == 0 || ttl < minTTL {
+					minTTL = ttl
+				}
+			}
+		}
+
+		pos += rdlength
+	}
+
+	if len(ips) == 0 {
+		return "", nil, 0, false
+	}
+	return name, ips, minTTL, true
 }
 
 // isPrivateIP — грубая проверка, что IP из приватного диапазона.
@@ -436,16 +539,33 @@ func isPrivateIP(ip string) bool {
 // DNSMapping — хранилище связей name → IP и IP → name.
 type DNSMapping struct {
 	mu        sync.RWMutex
-	nameToIPs map[string]map[string]time.Time // name -> (IP -> lastSeen)
-	ipToNames map[string]map[string]time.Time // IP -> (name -> lastSeen)
+	nameToIPs map[string]map[string]time.Time // старое: name -> (IP -> lastSeen)
+	ipToNames map[string]map[string]time.Time // старое: IP -> (name -> lastSeen)
 	maxAge    time.Duration
+
+	// новое: история наблюдений
+	observations map[string][]DNSObservation // key = name + "|" + ip
+}
+
+// DNSObservation — одно наблюдение DNS-ответа.
+type DNSObservation struct {
+	QName      string
+	QType      string
+	Answers    []string
+	ObservedAt time.Time
+	ExpiresAt  time.Time
+	ClientIP   string
+	ResolverIP string
+	Transport  string
+	TTL        uint32
 }
 
 func NewDNSMapping() *DNSMapping {
 	return &DNSMapping{
-		nameToIPs: make(map[string]map[string]time.Time),
-		ipToNames: make(map[string]map[string]time.Time),
-		maxAge:    2 * time.Minute,
+		nameToIPs:    make(map[string]map[string]time.Time),
+		ipToNames:    make(map[string]map[string]time.Time),
+		maxAge:       2 * time.Minute,
+		observations: make(map[string][]DNSObservation),
 	}
 }
 
@@ -468,6 +588,76 @@ func (m *DNSMapping) Add(name, ip string) {
 		m.ipToNames[ip] = make(map[string]time.Time)
 	}
 	m.ipToNames[ip][name] = now
+}
+
+// AddObservation добавляет наблюдение DNS-ответа.
+func (m *DNSMapping) AddObservation(obs DNSObservation) {
+	if obs.QName == "" || len(obs.Answers) == 0 {
+		return
+	}
+	if obs.ObservedAt.IsZero() {
+		obs.ObservedAt = time.Now()
+	}
+	if obs.ExpiresAt.IsZero() {
+		if obs.TTL > 0 {
+			obs.ExpiresAt = obs.ObservedAt.Add(time.Duration(obs.TTL) * time.Second)
+		} else {
+			obs.ExpiresAt = obs.ObservedAt.Add(10 * time.Minute)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, ip := range obs.Answers {
+		key := obs.QName + "|" + ip
+		m.observations[key] = append(m.observations[key], obs)
+		// Ограничиваем историю — максимум 16 записей на пару
+		if len(m.observations[key]) > 16 {
+			m.observations[key] = m.observations[key][len(m.observations[key])-16:]
+		}
+	}
+}
+
+// NamesForIPAt возвращает имена, чьи наблюдения были актуальны на момент at.
+func (m *DNSMapping) NamesForIPAt(ip string, at time.Time) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	names := make(map[string]bool)
+	for key, obsList := range m.observations {
+		name, obsIP, ok := splitObsKey(key)
+		if !ok || obsIP != ip {
+			continue
+		}
+		for _, o := range obsList {
+			// Наблюдение должно быть ДО момента at
+			if o.ObservedAt.After(at) {
+				continue
+			}
+			// И ещё не истекло на момент at
+			if !o.ExpiresAt.IsZero() && o.ExpiresAt.Before(at) {
+				continue
+			}
+			names[name] = true
+			break
+		}
+	}
+
+	out := make([]string, 0, len(names))
+	for n := range names {
+		out = append(out, n)
+	}
+	return out
+}
+
+func splitObsKey(key string) (name, ip string, ok bool) {
+	for i := len(key) - 1; i >= 0; i-- {
+		if key[i] == '|' {
+			return key[:i], key[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 // IPsForName возвращает список IP, в которые резолвился name за последнее время.
@@ -517,6 +707,26 @@ func (m *DNSMapping) Update(payload []byte) {
 	for _, ip := range ips {
 		m.Add(name, ip)
 	}
+
+	// Дополнительно — наблюдение с TTL
+	name2, ips2, ttl, ok2 := parseDNSResponseTTL(payload)
+	if !ok2 {
+		return
+	}
+	now := time.Now()
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = now.Add(time.Duration(ttl) * time.Second)
+	} else {
+		expiresAt = now.Add(10 * time.Minute)
+	}
+	m.AddObservation(DNSObservation{
+		QName:      name2,
+		Answers:    ips2,
+		ObservedAt: now,
+		ExpiresAt:  expiresAt,
+		TTL:        ttl,
+	})
 }
 
 // Len возвращает число известных пар name → IP.
