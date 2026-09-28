@@ -11,6 +11,49 @@ import (
 	"digger/internal/proc"
 )
 
+type ReconstructionStatus int
+
+const (
+	ReconUnknown ReconstructionStatus = iota
+	ReconEmpty
+	ReconPartial
+	ReconComplete
+	ReconGap
+)
+
+func (r ReconstructionStatus) String() string {
+	switch r {
+	case ReconUnknown:
+		return "unknown"
+	case ReconEmpty:
+		return "empty"
+	case ReconPartial:
+		return "partial"
+	case ReconComplete:
+		return "complete"
+	case ReconGap:
+		return "gap"
+	default:
+		return "?"
+	}
+}
+
+// reconPriority — чем больше, тем «важнее» статус для агрегата.
+func reconPriority(r ReconstructionStatus) int {
+	switch r {
+	case ReconComplete:
+		return 4
+	case ReconGap:
+		return 3
+	case ReconPartial:
+		return 2
+	case ReconEmpty:
+		return 1
+	default:
+		return 0
+	}
+}
+
 type FlowKey struct {
 	LocalIP    string
 	LocalPort  uint16
@@ -88,6 +131,9 @@ type FlowStats struct {
 	// Аккумулятор payload'а для извлечения SNI из фрагментированного ClientHello
 	pendingPayload []byte
 	sniExtracted   bool
+
+	// Насколько полно реконструирован payload
+	Recon ReconstructionStatus
 }
 
 // AggregatedFlow — суммарная статистика по SNI (или remote IP).
@@ -111,6 +157,8 @@ type AggregatedFlow struct {
 	MSS      uint16
 	WS       uint8
 	MSSKnown bool
+
+	Recon ReconstructionStatus
 }
 
 type FlowTable struct {
@@ -276,6 +324,7 @@ func (ft *FlowTable) SetSNI(key FlowKey, sni string) {
 	if f, ok := ft.flows[key]; ok {
 		if f.SNI == "" {
 			f.SNI = sni
+			f.Recon = ReconComplete
 		}
 	}
 }
@@ -308,6 +357,7 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 	if sni := extractSNI(f.pendingPayload); sni != "" {
 		f.SNI = sni
 		f.sniExtracted = true
+		f.Recon = ReconComplete
 		f.pendingPayload = nil
 		return sni
 	}
@@ -390,6 +440,20 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 			label = f.Key.RemoteIP
 		}
 
+		// Пометка о неполной реконструкции — только для TCP/443
+		reconNote := ""
+		if f.Key.Proto == "TCP" && f.Key.RemotePort == 443 {
+			switch f.Recon {
+			case ReconGap:
+				reconNote = " ⚠gap"
+			case ReconPartial:
+				reconNote = " ⚠partial"
+			}
+		}
+		if reconNote != "" {
+			label += reconNote
+		}
+
 		process := "?"
 		if f.Comm != "" {
 			process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
@@ -419,6 +483,10 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		g.PacketsIn += f.PacketsIn
 		g.BytesIn += f.BytesIn
 		g.Retransmits += f.Retransmits
+		// Агрегируем Recon: если хотя бы один поток complete — значит SNI есть
+		if g.Recon == ReconUnknown || reconPriority(f.Recon) > reconPriority(g.Recon) {
+			g.Recon = f.Recon
+		}
 		g.Gaps += f.Gaps
 
 		if f.LastSeen.After(g.LastSeen) {
@@ -538,8 +606,8 @@ func (ft *FlowTable) Print() {
 	}
 	fmt.Printf(") ===\n")
 
-	fmt.Printf("%-28s %-32s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
-		"PROCESS", "SNI / REMOTE", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
+	fmt.Printf("%-28s %-32s %-7s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
+		"PROCESS", "SNI / REMOTE", "RECON", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
 
 	for _, g := range groups {
 		age := time.Since(g.FirstSeen)
@@ -558,9 +626,26 @@ func (ft *FlowTable) Print() {
 		process := g.Process
 		label := truncate(g.Label, 32)
 
-		fmt.Printf("%-28s %-32s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
+		reconStr := "—"
+		if g.Proto == "TCP" {
+			switch g.Recon {
+			case ReconComplete:
+				reconStr = "✓"
+			case ReconPartial:
+				reconStr = "⚠part"
+			case ReconGap:
+				reconStr = "⚠gap"
+			case ReconEmpty:
+				reconStr = "·"
+			case ReconUnknown:
+				reconStr = "?"
+			}
+		}
+
+		fmt.Printf("%-28s %-32s %-7s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
 			truncate(process, 28),
 			label,
+			reconStr,
 			g.Proto,
 			g.Connections,
 			pktPerSec,
