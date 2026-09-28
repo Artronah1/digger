@@ -92,6 +92,7 @@ func (c *Capture) Run() {
 			c.dnsTable.Print()
 			printAttribution(c.flows.Snapshot(), c.dnsMapping)
 			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
+			printProxyProcesses(c.flows.Snapshot())
 			c.printAnomalies()
 			c.flows.PrintProfile(c.profileSNI)
 			if c.anomaly != nil {
@@ -110,6 +111,7 @@ func (c *Capture) Run() {
 			c.dnsTable.Print()
 			printAttribution(c.flows.Snapshot(), c.dnsMapping)
 			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
+			printProxyProcesses(c.flows.Snapshot())
 			c.printAnomalies()
 			c.flows.PrintProfile(c.profileSNI)
 		case pkt, ok := <-packets:

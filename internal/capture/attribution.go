@@ -275,3 +275,101 @@ func printProxySuspicions(flows []FlowStats, mapping *DNSMapping, anomaly *Anoma
 	}
 	fmt.Println()
 }
+
+// ProxyProcess — агрегат по процессу-прокси.
+type ProxyProcess struct {
+	Process   string
+	Conns     int
+	BytesOut  uint64
+	BytesIn   uint64
+	RemoteIPs int
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// BuildProxyProcesses собирает агрегат по процессам-прокси.
+func BuildProxyProcesses(flows []FlowStats) []ProxyProcess {
+	type agg struct {
+		conns     int
+		bytesOut  uint64
+		bytesIn   uint64
+		remoteIPs map[string]bool
+		firstSeen time.Time
+		lastSeen  time.Time
+	}
+
+	groups := make(map[string]*agg)
+
+	for _, f := range flows {
+		if f.Comm == "" {
+			continue
+		}
+		if !looksLikeProxyProcess(f.Comm) {
+			continue
+		}
+		if isPrivateIP(f.Key.RemoteIP) {
+			continue
+		}
+
+		g, ok := groups[f.Comm]
+		if !ok {
+			g = &agg{
+				remoteIPs: make(map[string]bool),
+				firstSeen: f.FirstSeen,
+			}
+			groups[f.Comm] = g
+		}
+		g.conns++
+		g.bytesOut += f.BytesOut
+		g.bytesIn += f.BytesIn
+		g.remoteIPs[f.Key.RemoteIP] = true
+		if f.LastSeen.After(g.lastSeen) {
+			g.lastSeen = f.LastSeen
+		}
+		if f.FirstSeen.Before(g.firstSeen) {
+			g.firstSeen = f.FirstSeen
+		}
+	}
+
+	out := make([]ProxyProcess, 0, len(groups))
+	for name, g := range groups {
+		out = append(out, ProxyProcess{
+			Process:   name,
+			Conns:     g.conns,
+			BytesOut:  g.bytesOut,
+			BytesIn:   g.bytesIn,
+			RemoteIPs: len(g.remoteIPs),
+			FirstSeen: g.firstSeen,
+			LastSeen:  g.lastSeen,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
+	return out
+}
+
+// printProxyProcesses выводит таблицу процессов-прокси.
+func printProxyProcesses(flows []FlowStats) {
+	procs := BuildProxyProcesses(flows)
+	if len(procs) == 0 {
+		return
+	}
+
+	fmt.Printf("\n=== ⚠ Прокси-процессы (%d) ===\n", len(procs))
+	fmt.Printf("%-22s %6s %10s %10s %6s %6s\n",
+		"PROCESS", "CONNS", "OUT", "IN", "IPs", "AGE")
+
+	for _, p := range procs {
+		age := time.Since(p.FirstSeen).Truncate(time.Second)
+		fmt.Printf("%-22s %6d %10s %10s %6d %6s\n",
+			truncate(p.Process, 22),
+			p.Conns,
+			humanBytes(p.BytesOut),
+			humanBytes(p.BytesIn),
+			p.RemoteIPs,
+			age.String())
+	}
+	fmt.Println()
+}
