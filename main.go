@@ -28,6 +28,8 @@ func main() {
 	routerMode := flag.Bool("router-mode", false, "режим роутера: считать outbound всё, что не от самого роутера")
 	logFile := flag.String("log", "", "писать вывод в файл (по умолчанию только в stdout)")
 	showPTR := flag.Bool("show-ptr", false, "показывать PTR-запросы в DNS-таблице")
+	groupBy := flag.String("group-by", "", "группировать по: app | device")
+	appFilter := flag.String("app", "", "показывать только это приложение/устройство")
 	flag.Parse()
 
 	if *netmapFlag {
@@ -80,6 +82,8 @@ func main() {
 	cap.SetActiveOnly(*activeOnly)
 	cap.SetDNSAge(*dnsAge)
 	cap.SetShowPTR(*showPTR)
+	cap.SetGroupBy(*groupBy)
+	cap.SetAppFilter(*appFilter)
 	cap.SetProfile(*profile)
 	cap.SetRouterMode(*routerMode)
 
@@ -94,6 +98,12 @@ func main() {
 		fmt.Printf(", фильтр: %s", *filter)
 	}
 	fmt.Printf(", min-pkts: %d\n", *minPkts)
+	if *groupBy != "" {
+		fmt.Printf(", группировка: %s\n", *groupBy)
+	}
+	if *appFilter != "" {
+		fmt.Printf(", фильтр приложения: %s\n", *appFilter)
+	}
 	if *activeOnly > 0 {
 		fmt.Printf(", active-only: %d сек\n", *activeOnly)
 	}

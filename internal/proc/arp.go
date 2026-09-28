@@ -89,14 +89,14 @@ func parseHexByte(s string) byte {
 		c := s[i]
 		var v byte
 		switch {
-			case c >= '0' && c <= '9':
-				v = c - '0'
-			case c >= 'a' && c <= 'f':
-				v = c - 'a' + 10
-			case c >= 'A' && c <= 'F':
-				v = c - 'A' + 10
-			default:
-				return 0
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'f':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			v = c - 'A' + 10
+		default:
+			return 0
 		}
 		b = b<<4 | v
 	}

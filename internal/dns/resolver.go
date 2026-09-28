@@ -34,9 +34,9 @@ func (r *Resolver) Lookup(ip string) string {
 
 	// неблокирующая постановка в очередь
 	select {
-		case r.queue <- ip:
-		default:
-			// очередь переполнена, пропускаем
+	case r.queue <- ip:
+	default:
+		// очередь переполнена, пропускаем
 	}
 	return ""
 }

@@ -131,18 +131,18 @@ func parseHexAddr(s string) (SocketAddr, error) {
 
 	var ip net.IP
 	switch len(ipBytes) {
-		case 4:
-			ip = net.IPv4(ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0])
-		case 16:
-			ip = make(net.IP, 16)
-			for i := 0; i < 4; i++ {
-				ip[i*4+0] = ipBytes[i*4+3]
-				ip[i*4+1] = ipBytes[i*4+2]
-				ip[i*4+2] = ipBytes[i*4+1]
-				ip[i*4+3] = ipBytes[i*4+0]
-			}
-		default:
-			return SocketAddr{}, fmt.Errorf("unexpected ip len: %d", len(ipBytes))
+	case 4:
+		ip = net.IPv4(ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0])
+	case 16:
+		ip = make(net.IP, 16)
+		for i := 0; i < 4; i++ {
+			ip[i*4+0] = ipBytes[i*4+3]
+			ip[i*4+1] = ipBytes[i*4+2]
+			ip[i*4+2] = ipBytes[i*4+1]
+			ip[i*4+3] = ipBytes[i*4+0]
+		}
+	default:
+		return SocketAddr{}, fmt.Errorf("unexpected ip len: %d", len(ipBytes))
 	}
 
 	return SocketAddr{IP: ip, Port: uint16(port)}, nil

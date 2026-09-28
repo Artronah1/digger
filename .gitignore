@@ -5,3 +5,5 @@
 *.pcap
 *.test
 dist/
+GeoLite2-Country.mmdb
+GeoLite2-Country.mmdb.gz

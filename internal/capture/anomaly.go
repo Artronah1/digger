@@ -96,53 +96,53 @@ func (ad *AnomalyDetector) CheckDomain(domain string, isDNS bool) string {
 
 	if strings.HasSuffix(domain, ".in-addr.arpa") ||
 		strings.HasSuffix(domain, ".ip6.arpa") {
-			return ""
-		}
+		return ""
+	}
 
-		ad.mu.Lock()
-		defer ad.mu.Unlock()
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
 
-		now := time.Now()
-		var flags []string
+	now := time.Now()
+	var flags []string
 
-		labels := strings.Split(domain, ".")
-		if len(labels) > 1 {
-			leftLabel := labels[0]
-			if hashLabelRe.MatchString(leftLabel) {
-				if _, reported := ad.reportedHash[domain]; !reported ||
-					now.Sub(ad.reportedHash[domain]) > 5*time.Minute {
-						flags = append(flags, "⚠HASH")
-						ad.reportedHash[domain] = now
-						ad.anomalies = append(ad.anomalies, AnomalyRecord{
-							Time:   now,
-							Kind:   "HASH",
-							Domain: domain,
-						})
-					}
+	labels := strings.Split(domain, ".")
+	if len(labels) > 1 {
+		leftLabel := labels[0]
+		if hashLabelRe.MatchString(leftLabel) {
+			if _, reported := ad.reportedHash[domain]; !reported ||
+				now.Sub(ad.reportedHash[domain]) > 5*time.Minute {
+				flags = append(flags, "⚠HASH")
+				ad.reportedHash[domain] = now
+				ad.anomalies = append(ad.anomalies, AnomalyRecord{
+					Time:   now,
+					Kind:   "HASH",
+					Domain: domain,
+				})
 			}
 		}
+	}
 
-		if isDNS {
-			if !ad.knownDomains[domain] {
-				if _, reported := ad.reportedNew[domain]; !reported ||
-					now.Sub(ad.reportedNew[domain]) > 5*time.Minute {
-						flags = append(flags, "⚡NEW")
-						ad.reportedNew[domain] = now
-						ad.anomalies = append(ad.anomalies, AnomalyRecord{
-							Time:   now,
-							Kind:   "NEW",
-							Domain: domain,
-						})
-					}
-					ad.knownDomains[domain] = true
-					ad.historyDirty = true
+	if isDNS {
+		if !ad.knownDomains[domain] {
+			if _, reported := ad.reportedNew[domain]; !reported ||
+				now.Sub(ad.reportedNew[domain]) > 5*time.Minute {
+				flags = append(flags, "⚡NEW")
+				ad.reportedNew[domain] = now
+				ad.anomalies = append(ad.anomalies, AnomalyRecord{
+					Time:   now,
+					Kind:   "NEW",
+					Domain: domain,
+				})
 			}
+			ad.knownDomains[domain] = true
+			ad.historyDirty = true
 		}
+	}
 
-		if len(flags) == 0 {
-			return ""
-		}
-		return strings.Join(flags, " ")
+	if len(flags) == 0 {
+		return ""
+	}
+	return strings.Join(flags, " ")
 }
 
 func (ad *AnomalyDetector) CheckDNSLeak(dstIP, domain string) string {
@@ -156,18 +156,18 @@ func (ad *AnomalyDetector) CheckDNSLeak(dstIP, domain string) string {
 	now := time.Now()
 	if _, reported := ad.reportedLeak[dstIP]; reported &&
 		now.Sub(ad.reportedLeak[dstIP]) < 5*time.Minute {
-			return ""
-		}
-		ad.reportedLeak[dstIP] = now
+		return ""
+	}
+	ad.reportedLeak[dstIP] = now
 
-		ad.anomalies = append(ad.anomalies, AnomalyRecord{
-			Time:   now,
-			Kind:   "DNS-LEAK",
-			Domain: domain,
-			Detail: fmt.Sprintf("→ %s", dstIP),
-		})
+	ad.anomalies = append(ad.anomalies, AnomalyRecord{
+		Time:   now,
+		Kind:   "DNS-LEAK",
+		Domain: domain,
+		Detail: fmt.Sprintf("→ %s", dstIP),
+	})
 
-		return fmt.Sprintf("⚠DNS-LEAK → %s", dstIP)
+	return fmt.Sprintf("⚠DNS-LEAK → %s", dstIP)
 }
 
 // RecordDNSOnly запоминает DNS-запрос без последующего соединения.
@@ -177,41 +177,41 @@ func (ad *AnomalyDetector) RecordDNSOnly(domain string) {
 	}
 	if strings.HasSuffix(domain, ".in-addr.arpa") ||
 		strings.HasSuffix(domain, ".ip6.arpa") {
+		return
+	}
+
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
+
+	// Если домен уже был в истории — не считаем beaconing
+	if ad.knownDomains[domain] {
+		return
+	}
+
+	now := time.Now()
+	if _, ok := ad.dnsOnlyDomains[domain]; !ok {
+		ad.dnsOnlyDomains[domain] = now
+	}
+	ad.dnsOnlyCounts[domain]++
+
+	count := ad.dnsOnlyCounts[domain]
+	first := ad.dnsOnlyDomains[domain]
+	elapsed := now.Sub(first)
+
+	if count >= 3 && elapsed >= 30*time.Second {
+		key := "BEACON|" + domain
+		if ad.printed[key] {
 			return
 		}
+		ad.printed[key] = true
 
-		ad.mu.Lock()
-		defer ad.mu.Unlock()
-
-		// Если домен уже был в истории — не считаем beaconing
-		if ad.knownDomains[domain] {
-			return
-		}
-
-		now := time.Now()
-		if _, ok := ad.dnsOnlyDomains[domain]; !ok {
-			ad.dnsOnlyDomains[domain] = now
-		}
-		ad.dnsOnlyCounts[domain]++
-
-		count := ad.dnsOnlyCounts[domain]
-		first := ad.dnsOnlyDomains[domain]
-		elapsed := now.Sub(first)
-
-		if count >= 3 && elapsed >= 30*time.Second {
-			key := "BEACON|" + domain
-			if ad.printed[key] {
-				return
-			}
-			ad.printed[key] = true
-
-			ad.anomalies = append(ad.anomalies, AnomalyRecord{
-				Time:   now,
-				Kind:   "BEACON",
-				Domain: domain,
-				Detail: fmt.Sprintf("(%d DNS за %s без соединений)", count, elapsed.Truncate(time.Second)),
-			})
-		}
+		ad.anomalies = append(ad.anomalies, AnomalyRecord{
+			Time:   now,
+			Kind:   "BEACON",
+			Domain: domain,
+			Detail: fmt.Sprintf("(%d DNS за %s без соединений)", count, elapsed.Truncate(time.Second)),
+		})
+	}
 }
 
 // MarkConnected — если домен соединился, сбрасываем счётчик beaconing.
@@ -284,16 +284,16 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 
 		kind := ""
 		switch a.Kind {
-			case "NEW":
-				kind = "⚡NEW "
-			case "HASH":
-				kind = "⚠HASH"
-			case "DNS-LEAK":
-				kind = "⚠LEAK"
-			case "BEACON":
-				kind = "⚠BEACON"
-			default:
-				kind = a.Kind
+		case "NEW":
+			kind = "⚡NEW "
+		case "HASH":
+			kind = "⚠HASH"
+		case "DNS-LEAK":
+			kind = "⚠LEAK"
+		case "BEACON":
+			kind = "⚠BEACON"
+		default:
+			kind = a.Kind
 		}
 
 		proc := a.Process
@@ -307,7 +307,7 @@ func (ad *AnomalyDetector) PrintAnomalies(window time.Duration) {
 		}
 
 		fmt.Printf("[%s] %-8s %-40s %s%s\n",
-			   ts, kind, truncate(a.Domain, 40), proc, detail)
+			ts, kind, truncate(a.Domain, 40), proc, detail)
 	}
 	fmt.Println()
 }

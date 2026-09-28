@@ -111,20 +111,20 @@ func parseQUICInitial(payload []byte) (*quicInitialInfo, bool) {
 
 	pnOffset := pos
 	protectedStart := pos
-		protectedEnd := pos + int(lengthVal)
-			if protectedEnd > len(payload) {
-				protectedEnd = len(payload)
-			}
+	protectedEnd := pos + int(lengthVal)
+	if protectedEnd > len(payload) {
+		protectedEnd = len(payload)
+	}
 
-			return &quicInitialInfo{
-				Version:       version,
-				DCID:          dcid,
-				SCID:          scid,
-				PayloadLen:    int(lengthVal),
-				Header:        payload[:protectedStart],
-				ProtectedPart: payload[protectedStart:protectedEnd],
-				PNOffset:      pnOffset,
-			}, true
+	return &quicInitialInfo{
+		Version:       version,
+		DCID:          dcid,
+		SCID:          scid,
+		PayloadLen:    int(lengthVal),
+		Header:        payload[:protectedStart],
+		ProtectedPart: payload[protectedStart:protectedEnd],
+		PNOffset:      pnOffset,
+	}, true
 }
 
 // deriveInitialKeys выводит client initial key, iv и hp из DCID.
@@ -219,9 +219,9 @@ func decryptInitial(info *quicInitialInfo, isServer bool) ([]byte, error) {
 
 	// AAD = Long Header + восстановленный PN
 	aad := make([]byte, 0, len(info.Header)+pnLen)
-	aad = append(aad, info.Header...)      // flags + version + DCID + SCID + Token + Length
-	aad = append(aad, pnBytes...)          // восстановленный PN
-	aad[0] = flags                     // flags с снятой protection
+	aad = append(aad, info.Header...) // flags + version + DCID + SCID + Token + Length
+	aad = append(aad, pnBytes...)     // восстановленный PN
+	aad[0] = flags                    // flags с снятой protection
 
 	// Зашифрованные данные — всё после PN
 	encryptedStart := pnLen
@@ -304,87 +304,87 @@ func extractSNIFromCrypto(plaintext []byte) string {
 		pos++
 
 		switch frameType {
-			case 0x00: // PADDING
-				continue
-			case 0x01: // PING
-				continue
-			case 0x02, 0x03: // ACK
-				// Слишком сложно парсить, пропускаем
+		case 0x00: // PADDING
+			continue
+		case 0x01: // PING
+			continue
+		case 0x02, 0x03: // ACK
+			// Слишком сложно парсить, пропускаем
+			return ""
+		case 0x06: // CRYPTO
+			_, n := readVarint(plaintext[pos:])
+			pos += n
+			length, n := readVarint(plaintext[pos:])
+			pos += n
+			if pos+int(length) > len(plaintext) {
 				return ""
-			case 0x06: // CRYPTO
-				_, n := readVarint(plaintext[pos:])
-				pos += n
-				length, n := readVarint(plaintext[pos:])
-				pos += n
-				if pos+int(length) > len(plaintext) {
-					return ""
-				}
-				cryptoData := plaintext[pos : pos+int(length)]
+			}
+			cryptoData := plaintext[pos : pos+int(length)]
 
-				// Попытка 1: TLS ClientHello (с TLS-record обёрткой)
-				if sni := extractSNI(cryptoData); sni != "" {
+			// Попытка 1: TLS ClientHello (с TLS-record обёрткой)
+			if sni := extractSNI(cryptoData); sni != "" {
+				return sni
+			}
+
+			// Попытка 2: raw ClientHello (handshake без record)
+			if len(cryptoData) >= 4 && cryptoData[0] == 0x01 {
+				if sni := extractClientHelloSNI(cryptoData); sni != "" {
 					return sni
 				}
+			}
 
-				// Попытка 2: raw ClientHello (handshake без record)
-				if len(cryptoData) >= 4 && cryptoData[0] == 0x01 {
-					if sni := extractClientHelloSNI(cryptoData); sni != "" {
-						return sni
-					}
-				}
-
-				// Попытка 3: QUIC preamble с plaintext SNI (y.googlevideo.com)
-				// Если данные начинаются с ASCII-буквы и содержат точку — это SNI.
-				if len(cryptoData) >= 4 {
-					c := cryptoData[0]
-					if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-						// Ищем точку и конец имени (NUL или непечатаемый байт)
-						end := 0
-						for end < len(cryptoData) && end < 256 {
-							b := cryptoData[end]
-							if b == 0 {
-								break
-							}
-							if b < 0x20 || b > 0x7E {
-								break
-							}
-							end++
+			// Попытка 3: QUIC preamble с plaintext SNI (y.googlevideo.com)
+			// Если данные начинаются с ASCII-буквы и содержат точку — это SNI.
+			if len(cryptoData) >= 4 {
+				c := cryptoData[0]
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+					// Ищем точку и конец имени (NUL или непечатаемый байт)
+					end := 0
+					for end < len(cryptoData) && end < 256 {
+						b := cryptoData[end]
+						if b == 0 {
+							break
 						}
-						if end > 0 && end < len(cryptoData) {
-							name := string(cryptoData[:end])
-							// Простейшая проверка: имя должно содержать точку
-							if strings.Contains(name, ".") {
-								return name
-							}
+						if b < 0x20 || b > 0x7E {
+							break
+						}
+						end++
+					}
+					if end > 0 && end < len(cryptoData) {
+						name := string(cryptoData[:end])
+						// Простейшая проверка: имя должно содержать точку
+						if strings.Contains(name, ".") {
+							return name
 						}
 					}
 				}
+			}
 
-				pos += int(length)
+			pos += int(length)
 
-				// Отладка: показываем первые байты CRYPTO
-				headLen := 32
-				if len(cryptoData) < headLen {
-					headLen = len(cryptoData)
-				}
+			// Отладка: показываем первые байты CRYPTO
+			headLen := 32
+			if len(cryptoData) < headLen {
+				headLen = len(cryptoData)
+			}
 
-				// Пробуем оба варианта: с TLS-record заголовком и без
-				if sni := extractSNI(cryptoData); sni != "" {
+			// Пробуем оба варианта: с TLS-record заголовком и без
+			if sni := extractSNI(cryptoData); sni != "" {
+				return sni
+			}
+
+			// Если не сработало — возможно, это handshake без TLS-record (raw)
+			if len(cryptoData) >= 4 && cryptoData[0] == 0x01 {
+				// ClientHello напрямую
+				if sni := extractClientHelloSNI(cryptoData); sni != "" {
+					fmt.Printf("[CRYPTO-DBG] FOUND SNI (raw)=%s\n", sni)
 					return sni
 				}
+			}
 
-				// Если не сработало — возможно, это handshake без TLS-record (raw)
-				if len(cryptoData) >= 4 && cryptoData[0] == 0x01 {
-					// ClientHello напрямую
-					if sni := extractClientHelloSNI(cryptoData); sni != "" {
-						fmt.Printf("[CRYPTO-DBG] FOUND SNI (raw)=%s\n", sni)
-						return sni
-					}
-				}
-
-				pos += int(length)
-			default:
-				return ""
+			pos += int(length)
+		default:
+			return ""
 		}
 	}
 	return ""
@@ -398,27 +398,27 @@ func readVarint(b []byte) (uint64, int) {
 	}
 	first := b[0]
 	switch first & 0xC0 {
-		case 0x00:
-			// 1 байт
-			return uint64(first & 0x3F), 1
-		case 0x40:
-			// 2 байта
-			if len(b) < 2 {
-				return 0, 0
-			}
-			return uint64(binary.BigEndian.Uint16(b[:2]) & 0x3FFF), 2
-		case 0x80:
-			// 4 байта
-			if len(b) < 4 {
-				return 0, 0
-			}
-			return uint64(binary.BigEndian.Uint32(b[:4]) & 0x3FFFFFFF), 4
-		case 0xC0:
-			// 8 байт
-			if len(b) < 8 {
-				return 0, 0
-			}
-			return binary.BigEndian.Uint64(b[:8]) & 0x3FFFFFFFFFFFFFFF, 8
+	case 0x00:
+		// 1 байт
+		return uint64(first & 0x3F), 1
+	case 0x40:
+		// 2 байта
+		if len(b) < 2 {
+			return 0, 0
+		}
+		return uint64(binary.BigEndian.Uint16(b[:2]) & 0x3FFF), 2
+	case 0x80:
+		// 4 байта
+		if len(b) < 4 {
+			return 0, 0
+		}
+		return uint64(binary.BigEndian.Uint32(b[:4]) & 0x3FFFFFFF), 4
+	case 0xC0:
+		// 8 байт
+		if len(b) < 8 {
+			return 0, 0
+		}
+		return binary.BigEndian.Uint64(b[:8]) & 0x3FFFFFFFFFFFFFFF, 8
 	}
 	return 0, 0
 }
