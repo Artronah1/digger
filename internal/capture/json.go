@@ -152,6 +152,7 @@ func (c *Capture) printAllJSON() {
 	c.printSnapshotJSON()
 	c.printHealthJSON()
 	c.printFlowsJSON()
+	c.printDNSJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
@@ -206,6 +207,47 @@ func (c *Capture) printFlowsJSON() {
 			FirstSeen:         g.FirstSeen.UTC().Format(time.RFC3339Nano),
 			LastSeen:          g.LastSeen.UTC().Format(time.RFC3339Nano),
 			CaptureIncomplete: incomplete,
+		}
+		printJSON(ev)
+	}
+}
+
+// DNSEvent — один DNS-запрос.
+type DNSEvent struct {
+	Event
+
+	Cycle     int    `json:"cycle"`
+	Name      string `json:"name"`
+	QType     string `json:"qtype"`
+	SrcIP     string `json:"src_ip"`
+	DstIP     string `json:"dst_ip"`
+	Transport string `json:"transport"`
+	Count     uint64 `json:"count"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+	Flags     string `json:"flags,omitempty"`
+}
+
+// printDNSJSON печатает DNS-запросы.
+func (c *Capture) printDNSJSON() {
+	queries := c.dnsTable.Snapshot()
+	for _, q := range queries {
+		// Пропускаем PTR, если showPTR = false
+		if !c.showPTR && strings.HasSuffix(q.Name, ".in-addr.arpa") {
+			continue
+		}
+		ev := DNSEvent{
+			Event:     newEvent("dns"),
+			Cycle:     c.printCycle,
+			Name:      q.Name,
+			QType:     q.QType,
+			SrcIP:     q.SrcIP,
+			DstIP:     q.DstIP,
+			Transport: q.Transport,
+			Count:     q.Count,
+			FirstSeen: q.FirstSeen.UTC().Format(time.RFC3339Nano),
+			LastSeen:  q.LastSeen.UTC().Format(time.RFC3339Nano),
+			Flags:     q.Flags,
 		}
 		printJSON(ev)
 	}

@@ -31,6 +31,7 @@ type Capture struct {
 	stats      CaptureStats
 	outputMode string // "text" | "json"
 	printCycle int
+	showPTR    bool
 }
 
 type CaptureStats struct {
@@ -89,10 +90,13 @@ func (c *Capture) SetHideIdle(v bool)        { c.flows.SetHideIdle(v) }
 func (c *Capture) SetActiveOnly(n int)       { c.flows.SetActiveOnly(n) }
 func (c *Capture) SetProfile(sni string)     { c.profileSNI = sni }
 func (c *Capture) SetDNSAge(d time.Duration) { c.dnsTable.SetMaxAge(d) }
-func (c *Capture) SetShowPTR(v bool)         { c.dnsTable.SetShowPTR(v) }
-func (c *Capture) SetGroupBy(s string)       { c.groupBy = s }
-func (c *Capture) SetAppFilter(s string)     { c.appFilter = s; c.flows.SetAppFilter(s) }
-func (c *Capture) SetRouterMode(v bool)      { c.routerMode = v }
+func (c *Capture) SetShowPTR(v bool) {
+	c.showPTR = v
+	c.dnsTable.SetShowPTR(v)
+}
+func (c *Capture) SetGroupBy(s string)   { c.groupBy = s }
+func (c *Capture) SetAppFilter(s string) { c.appFilter = s; c.flows.SetAppFilter(s) }
+func (c *Capture) SetRouterMode(v bool)  { c.routerMode = v }
 
 func (c *Capture) SetFilter(expr string) error {
 	c.filter = expr
