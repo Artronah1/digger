@@ -3,8 +3,10 @@ package capture
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -48,6 +50,7 @@ func printJSON(v any) {
 // SnapshotEvent — мета о запуске.
 type SnapshotEvent struct {
 	Event
+	Cycle   int    `json:"cycle"`
 	Iface   string `json:"iface"`
 	Filter  string `json:"filter"`
 	Snaplen int    `json:"snaplen"`
@@ -58,6 +61,7 @@ type SnapshotEvent struct {
 // HealthEvent — счётчики Capture Health.
 type HealthEvent struct {
 	Event
+	Cycle            int    `json:"cycle"`
 	Iface            string `json:"iface"`
 	Filter           string `json:"filter"`
 	Snaplen          int    `json:"snaplen"`
@@ -72,10 +76,37 @@ type HealthEvent struct {
 	Quality          string `json:"quality"`
 }
 
+// FlowEvent — один агрегированный поток.
+type FlowEvent struct {
+	Event
+
+	Cycle             int    `json:"cycle"`
+	Label             string `json:"label"` // Идентификатор потока (SNI, Hostname или IP)
+	Process           string `json:"process"`
+	SNI               string `json:"sni,omitempty"`      // Только если Label является настоящим SNI
+	Hostname          string `json:"hostname,omitempty"` // Если Label является hostname
+	RemoteIP          string `json:"remote_ip,omitempty"`
+	RemotePort        uint16 `json:"remote_port,omitempty"`
+	Proto             string `json:"proto"`
+	Recon             string `json:"recon,omitempty"`
+	Conns             int    `json:"conns"`
+	PacketsOut        uint64 `json:"packets_out"`
+	BytesOut          uint64 `json:"bytes_out"`
+	PacketsIn         uint64 `json:"packets_in"`
+	BytesIn           uint64 `json:"bytes_in"`
+	Retransmits       uint64 `json:"retransmits"`
+	Gaps              uint64 `json:"gaps"`
+	AgeSec            int64  `json:"age_sec"`
+	FirstSeen         string `json:"first_seen"`
+	LastSeen          string `json:"last_seen"`
+	CaptureIncomplete bool   `json:"capture_incomplete,omitempty"`
+}
+
 // printSnapshotJSON печатает мета о запуске.
 func (c *Capture) printSnapshotJSON() {
 	ev := SnapshotEvent{
 		Event:   newEvent("snapshot"),
+		Cycle:   c.printCycle,
 		Iface:   c.iface,
 		Filter:  c.filter,
 		Snaplen: c.snaplen,
@@ -98,6 +129,7 @@ func (c *Capture) printHealthJSON() {
 
 	ev := HealthEvent{
 		Event:            newEvent("health"),
+		Cycle:            c.printCycle,
 		Iface:            c.iface,
 		Filter:           c.filter,
 		Snaplen:          c.snaplen,
@@ -115,9 +147,66 @@ func (c *Capture) printHealthJSON() {
 }
 
 // printAllJSON — общая точка входа для JSON-режима.
-// Пока печатает только snapshot и health.
-// Дальше добавим flow, dns, attribution, proxy_suspicion, anomaly.
 func (c *Capture) printAllJSON() {
+	c.printCycle++
 	c.printSnapshotJSON()
 	c.printHealthJSON()
+	c.printFlowsJSON()
+}
+
+// looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
+func looksLikeSNI(s string) bool {
+	if s == "" {
+		return false
+	}
+	// IPv4
+	if net.ParseIP(s) != nil {
+		return false
+	}
+	// Домен должен содержать точку
+	return strings.Contains(s, ".")
+}
+
+// printFlowsJSON печатает агрегированные потоки.
+func (c *Capture) printFlowsJSON() {
+	flows := c.flows.Aggregate()
+
+	c.stats.mu.Lock()
+	incomplete := c.stats.PacketsTruncated > 0 || c.stats.DecodeErrors > 0
+	c.stats.mu.Unlock()
+
+	now := time.Now()
+
+	for _, g := range flows {
+		// Определяем настоящий SNI: в AggregatedFlow.Label лежит SNI/hostname/IP
+		// Если это IP или hostname, SNI пустой
+		sni := ""
+		label := g.Label
+
+		if looksLikeSNI(g.Label) {
+			sni = g.Label
+		}
+
+		ev := FlowEvent{
+			Event:             newEvent("flow"),
+			Cycle:             c.printCycle,
+			Label:             label,
+			Process:           g.Process,
+			SNI:               sni,
+			Proto:             g.Proto,
+			Recon:             g.Recon.String(),
+			Conns:             g.Connections,
+			PacketsOut:        g.PacketsOut,
+			BytesOut:          g.BytesOut,
+			PacketsIn:         g.PacketsIn,
+			BytesIn:           g.BytesIn,
+			Retransmits:       g.Retransmits,
+			Gaps:              g.Gaps,
+			AgeSec:            int64(now.Sub(g.FirstSeen).Seconds()),
+			FirstSeen:         g.FirstSeen.UTC().Format(time.RFC3339Nano),
+			LastSeen:          g.LastSeen.UTC().Format(time.RFC3339Nano),
+			CaptureIncomplete: incomplete,
+		}
+		printJSON(ev)
+	}
 }

@@ -30,6 +30,7 @@ type Capture struct {
 	snaplen    int
 	stats      CaptureStats
 	outputMode string // "text" | "json"
+	printCycle int
 }
 
 type CaptureStats struct {
