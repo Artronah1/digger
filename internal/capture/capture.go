@@ -25,6 +25,27 @@ type Capture struct {
 	routerMode bool
 	groupBy    string // "app" | "device" | ""
 	appFilter  string // фильтр по имени приложения
+
+	// Новые поля для статистики и метаданных
+	iface   string
+	filter  string
+	snaplen int
+	stats   CaptureStats
+}
+
+type CaptureStats struct {
+	mu sync.Mutex
+
+	PacketsReceived  uint64
+	PacketsProcessed uint64
+	PacketsTruncated uint64
+	DecodeErrors     uint64
+	NoIPLayer        uint64
+
+	BytesReceived  uint64
+	BytesProcessed uint64
+
+	StartedAt time.Time
 }
 
 func New(iface string, snaplen int, verbose bool) (*Capture, error) {
@@ -57,63 +78,55 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		dnsMapping: NewDNSMapping(),
 		anomaly:    anomalyDetector,
 		localIPs:   localIPs,
+
+		// Инициализация новых полей
+		iface:   iface,
+		snaplen: snaplen,
 	}, nil
 }
 
-func (c *Capture) SetMinPkts(n int)            { c.flows.SetMinPkts(n) }
-func (c *Capture) SetHideIdle(v bool)          { c.flows.SetHideIdle(v) }
-func (c *Capture) SetActiveOnly(n int)         { c.flows.SetActiveOnly(n) }
-func (c *Capture) SetProfile(sni string)       { c.profileSNI = sni }
-func (c *Capture) SetDNSAge(d time.Duration)   { c.dnsTable.SetMaxAge(d) }
-func (c *Capture) SetShowPTR(v bool)           { c.dnsTable.SetShowPTR(v) }
-func (c *Capture) SetGroupBy(s string)         { c.groupBy = s }
-func (c *Capture) SetAppFilter(s string)       { c.appFilter = s; c.flows.SetAppFilter(s) }
-func (c *Capture) SetFilter(expr string) error { return c.handle.SetBPFFilter(expr) }
-func (c *Capture) SetRouterMode(v bool)        { c.routerMode = v }
+func (c *Capture) SetMinPkts(n int)          { c.flows.SetMinPkts(n) }
+func (c *Capture) SetHideIdle(v bool)        { c.flows.SetHideIdle(v) }
+func (c *Capture) SetActiveOnly(n int)       { c.flows.SetActiveOnly(n) }
+func (c *Capture) SetProfile(sni string)     { c.profileSNI = sni }
+func (c *Capture) SetDNSAge(d time.Duration) { c.dnsTable.SetMaxAge(d) }
+func (c *Capture) SetShowPTR(v bool)         { c.dnsTable.SetShowPTR(v) }
+func (c *Capture) SetGroupBy(s string)       { c.groupBy = s }
+func (c *Capture) SetAppFilter(s string)     { c.appFilter = s; c.flows.SetAppFilter(s) }
+func (c *Capture) SetRouterMode(v bool)      { c.routerMode = v }
+
+func (c *Capture) SetFilter(expr string) error {
+	c.filter = expr
+	return c.handle.SetBPFFilter(expr)
+}
 
 func (c *Capture) Run() {
 	packets := c.handle.Listen()
 
-	printTicker := time.NewTicker(5 * time.Second)
-	defer printTicker.Stop()
+	c.stats.StartedAt = time.Now()
 
-	enrichTicker := time.NewTicker(1 * time.Second)
-	defer enrichTicker.Stop()
+	// Горутина печати — отдельно от чтения пакетов
+	printDone := make(chan struct{})
+	go func() {
+		defer close(printDone)
+		c.printLoop()
+	}()
 
+	// Горутина enrich — отдельно
+	enrichDone := make(chan struct{})
+	go func() {
+		defer close(enrichDone)
+		c.enrichLoop()
+	}()
+
+	// Основной цикл: только чтение пакетов
 	for {
 		select {
 		case <-c.stopCh:
-			c.flows.Enrich()
-			if c.groupBy == "app" || c.groupBy == "device" {
-				c.flows.PrintApps()
-			} else {
-				c.flows.Print()
-			}
-			c.dnsTable.Print()
-			printAttribution(c.flows.Snapshot(), c.dnsMapping)
-			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
-			printProxyProcesses(c.flows.Snapshot())
-			c.printAnomalies()
-			c.flows.PrintProfile(c.profileSNI)
-			if c.anomaly != nil {
-				c.anomaly.SaveHistory()
-			}
+			// Ждём завершения printLoop и enrichLoop
+			<-printDone
+			<-enrichDone
 			return
-		case <-enrichTicker.C:
-			c.flows.Enrich()
-		case <-printTicker.C:
-			c.flows.Enrich()
-			if c.groupBy == "app" || c.groupBy == "device" {
-				c.flows.PrintApps()
-			} else {
-				c.flows.Print()
-			}
-			c.dnsTable.Print()
-			printAttribution(c.flows.Snapshot(), c.dnsMapping)
-			printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
-			printProxyProcesses(c.flows.Snapshot())
-			c.printAnomalies()
-			c.flows.PrintProfile(c.profileSNI)
 		case pkt, ok := <-packets:
 			if !ok {
 				return
@@ -137,15 +150,45 @@ func (c *Capture) Close() {
 func (c *Capture) process(pkt pcap.Packet) {
 	data := pkt.B
 
+	c.stats.mu.Lock()
+	c.stats.PacketsReceived++
+	c.stats.BytesReceived += uint64(len(data))
+	c.stats.mu.Unlock()
+
 	packet := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
+
+	// Проверяем ошибки декодирования
+	if errLayer := packet.ErrorLayer(); errLayer != nil {
+		c.stats.mu.Lock()
+		c.stats.DecodeErrors++
+		c.stats.mu.Unlock()
+		return
+	}
+
+	// Проверяем усечение пакета (snaplen)
+	if meta := packet.Metadata(); meta != nil {
+		if meta.CaptureLength > 0 && meta.Length > 0 && meta.CaptureLength < meta.Length {
+			c.stats.mu.Lock()
+			c.stats.PacketsTruncated++
+			c.stats.mu.Unlock()
+		}
+	}
 
 	ipLayer := packet.NetworkLayer()
 	tcpLayer := packet.Layer(layers.LayerTypeTCP)
 	udpLayer := packet.Layer(layers.LayerTypeUDP)
 
 	if ipLayer == nil {
+		c.stats.mu.Lock()
+		c.stats.NoIPLayer++
+		c.stats.mu.Unlock()
 		return
 	}
+
+	c.stats.mu.Lock()
+	c.stats.PacketsProcessed++
+	c.stats.BytesProcessed += uint64(len(data))
+	c.stats.mu.Unlock()
 
 	var srcIP, dstIP string
 	switch ip := ipLayer.(type) {
@@ -197,16 +240,12 @@ func (c *Capture) process(pkt pcap.Packet) {
 
 		switch {
 		case srcIsLAN && !dstIsLAN:
-			// LAN-клиент → внешний мир = outbound
 			isOutbound = true
 		case !srcIsLAN && dstIsLAN:
-			// Внешний мир → LAN-клиент = inbound
 			isOutbound = false
 		case srcIsLAN && dstIsLAN:
-			// LAN ↔ LAN. Если src — не адрес роутера, это клиент → outbound
 			isOutbound = !c.localIPs[srcIP]
 		default:
-			// Ни то, ни другое (не должно случаться на br-lan)
 			isOutbound = false
 		}
 	} else {
@@ -289,6 +328,92 @@ func (c *Capture) process(pkt pcap.Packet) {
 		if det := detectVPN(payload, srcIP, dstIP, srcPort, dstPort); det != nil {
 			c.flows.MarkVPN(srcIP, srcPort, dstIP, dstPort, proto, det)
 		}
+	}
+}
+
+func (c *Capture) printLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			c.printAll()
+			return
+		case <-ticker.C:
+			c.printAll()
+		}
+	}
+}
+
+func (c *Capture) enrichLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			c.flows.Enrich()
+			return
+		case <-ticker.C:
+			c.flows.Enrich()
+		}
+	}
+}
+
+func (c *Capture) printAll() {
+	c.flows.Enrich()
+	if c.groupBy == "app" || c.groupBy == "device" {
+		c.flows.PrintApps()
+	} else {
+		c.flows.Print()
+	}
+	c.dnsTable.Print()
+	printAttribution(c.flows.Snapshot(), c.dnsMapping)
+	printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
+	printProxyProcesses(c.flows.Snapshot())
+	c.printAnomalies()
+	c.flows.PrintProfile(c.profileSNI)
+	c.printHealth()
+
+	if c.anomaly != nil {
+		c.anomaly.SaveHistory()
+	}
+}
+
+func (c *Capture) printHealth() {
+	c.stats.mu.Lock()
+	s := c.stats
+	c.stats.mu.Unlock()
+
+	uptime := time.Since(s.StartedAt).Truncate(time.Second)
+
+	quality := "✓ complete"
+	if s.PacketsTruncated > 0 || s.DecodeErrors > 0 {
+		quality = "⚠ incomplete"
+	}
+
+	fmt.Printf("\n=== Capture Health ===\n")
+	fmt.Printf("Interface:      %s\n", c.iface)
+	fmt.Printf("Filter:         %s\n", c.filter)
+	fmt.Printf("Snaplen:        %d\n", c.snaplen)
+	fmt.Printf("Uptime:         %s\n", uptime)
+	fmt.Printf("\n")
+	fmt.Printf("Packets:\n")
+	fmt.Printf("  received:     %d\n", s.PacketsReceived)
+	fmt.Printf("  processed:    %d\n", s.PacketsProcessed)
+	fmt.Printf("  truncated:    %d\n", s.PacketsTruncated)
+	fmt.Printf("  decode err:   %d\n", s.DecodeErrors)
+	fmt.Printf("  no IP layer:  %d\n", s.NoIPLayer)
+	fmt.Printf("\n")
+	fmt.Printf("Bytes:\n")
+	fmt.Printf("  received:     %s\n", humanBytes(s.BytesReceived))
+	fmt.Printf("  processed:    %s\n", humanBytes(s.BytesProcessed))
+	fmt.Printf("\n")
+	fmt.Printf("Quality:        %s\n", quality)
+
+	if quality == "⚠ incomplete" {
+		fmt.Printf("⚠  Вывод может быть неполным — часть пакетов потеряна или усечена.\n")
 	}
 }
 
