@@ -30,6 +30,7 @@ func main() {
 	showPTR := flag.Bool("show-ptr", false, "показывать PTR-запросы в DNS-таблице")
 	groupBy := flag.String("group-by", "", "группировать по: app | device")
 	appFilter := flag.String("app", "", "показывать только это приложение/устройство")
+	output := flag.String("output", "text", "формат вывода: text | json")
 	flag.Parse()
 
 	if *netmapFlag {
@@ -86,6 +87,7 @@ func main() {
 	cap.SetAppFilter(*appFilter)
 	cap.SetProfile(*profile)
 	cap.SetRouterMode(*routerMode)
+	cap.SetOutputMode(*output)
 
 	if *filter != "" {
 		if err := cap.SetFilter(*filter); err != nil {
@@ -93,21 +95,23 @@ func main() {
 		}
 	}
 
-	fmt.Printf("digger: захват на %s", *iface)
-	if *filter != "" {
-		fmt.Printf(", фильтр: %s", *filter)
+	if *output != "json" {
+		fmt.Printf("digger: захват на %s", *iface)
+		if *filter != "" {
+			fmt.Printf(", фильтр: %s", *filter)
+		}
+		fmt.Printf(", min-pkts: %d\n", *minPkts)
+		if *groupBy != "" {
+			fmt.Printf(", группировка: %s\n", *groupBy)
+		}
+		if *appFilter != "" {
+			fmt.Printf(", фильтр приложения: %s\n", *appFilter)
+		}
+		if *activeOnly > 0 {
+			fmt.Printf(", active-only: %d сек\n", *activeOnly)
+		}
+		fmt.Println("Нажмите Ctrl+C для остановки...")
 	}
-	fmt.Printf(", min-pkts: %d\n", *minPkts)
-	if *groupBy != "" {
-		fmt.Printf(", группировка: %s\n", *groupBy)
-	}
-	if *appFilter != "" {
-		fmt.Printf(", фильтр приложения: %s\n", *appFilter)
-	}
-	if *activeOnly > 0 {
-		fmt.Printf(", active-only: %d сек\n", *activeOnly)
-	}
-	fmt.Println("Нажмите Ctrl+C для остановки...")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -119,8 +123,12 @@ func main() {
 	}()
 
 	<-stop
-	fmt.Println("\nОстанавливаем захват...")
+	if *output != "json" {
+		fmt.Println("\nОстанавливаем захват...")
+	}
 	cap.Stop()
 	<-done
-	fmt.Println("Готово.")
+	if *output != "json" {
+		fmt.Println("Готово.")
+	}
 }

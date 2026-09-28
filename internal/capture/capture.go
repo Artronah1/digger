@@ -25,12 +25,11 @@ type Capture struct {
 	routerMode bool
 	groupBy    string // "app" | "device" | ""
 	appFilter  string // фильтр по имени приложения
-
-	// Новые поля для статистики и метаданных
-	iface   string
-	filter  string
-	snaplen int
-	stats   CaptureStats
+	iface      string
+	filter     string
+	snaplen    int
+	stats      CaptureStats
+	outputMode string // "text" | "json"
 }
 
 type CaptureStats struct {
@@ -78,10 +77,9 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		dnsMapping: NewDNSMapping(),
 		anomaly:    anomalyDetector,
 		localIPs:   localIPs,
-
-		// Инициализация новых полей
-		iface:   iface,
-		snaplen: snaplen,
+		iface:      iface,
+		snaplen:    snaplen,
+		outputMode: "text",
 	}, nil
 }
 
@@ -98,6 +96,13 @@ func (c *Capture) SetRouterMode(v bool)      { c.routerMode = v }
 func (c *Capture) SetFilter(expr string) error {
 	c.filter = expr
 	return c.handle.SetBPFFilter(expr)
+}
+
+func (c *Capture) SetOutputMode(mode string) {
+	if mode != "json" {
+		mode = "text"
+	}
+	c.outputMode = mode
 }
 
 func (c *Capture) Run() {
@@ -362,6 +367,12 @@ func (c *Capture) enrichLoop() {
 }
 
 func (c *Capture) printAll() {
+	if c.outputMode == "json" {
+		c.printAllJSON()
+		return
+	}
+
+	// текстовый режим — как раньше
 	c.flows.Enrich()
 	if c.groupBy == "app" || c.groupBy == "device" {
 		c.flows.PrintApps()
