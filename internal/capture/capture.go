@@ -38,9 +38,11 @@ type Capture struct {
 	quiet      bool
 	dnsAge     time.Duration
 	// PCAP-режим
-	pcapReader *pcapgo.Reader
-	pcapFile   *os.File
-	policy     *policy.Policy
+	pcapReader   *pcapgo.Reader
+	pcapFile     *os.File
+	policy       *policy.Policy
+	violations   []policy.Violation
+	violationsMu sync.Mutex
 }
 
 type CaptureStats struct {
@@ -124,6 +126,75 @@ func (c *Capture) SetOutputMode(mode string) {
 		mode = "text"
 	}
 	c.outputMode = mode
+}
+
+func (c *Capture) addViolation(v policy.Violation) {
+	c.violationsMu.Lock()
+	defer c.violationsMu.Unlock()
+
+	// Дедуп: одинаковый (rule, actual) — один раз
+	for _, existing := range c.violations {
+		if existing.Rule == v.Rule && existing.Actual == v.Actual {
+			return
+		}
+	}
+	c.violations = append(c.violations, v)
+}
+
+func (c *Capture) checkDirectOutbound() {
+	if c.policy == nil {
+		return
+	}
+	if len(c.policy.AllowDirect) == 0 {
+		return
+	}
+
+	flows := c.flows.Snapshot()
+	for _, f := range flows {
+		if f.SNI == "" {
+			continue
+		}
+		if f.Class == ClassDirect || f.Class == ClassUnknown {
+			continue
+		}
+		allowed := false
+		for _, d := range c.policy.AllowDirect {
+			if d == f.SNI {
+				allowed = true
+				break
+			}
+		}
+		if allowed {
+			c.addViolation(policy.Violation{
+				Rule:     "direct_outbound",
+				Expected: "direct",
+				Actual:   f.SNI,
+				Detail:   fmt.Sprintf("class=proxy, remote=%s", f.Key.RemoteIP),
+			})
+		}
+	}
+}
+
+func (c *Capture) printPolicyViolations() {
+	c.violationsMu.Lock()
+	vs := make([]policy.Violation, len(c.violations))
+	copy(vs, c.violations)
+	c.violationsMu.Unlock()
+
+	if len(vs) == 0 {
+		return
+	}
+
+	fmt.Printf("\n=== ⚠ Policy Violations (%d) ===\n", len(vs))
+	fmt.Printf("%-20s %-20s %-30s %s\n", "RULE", "EXPECTED", "ACTUAL", "DETAIL")
+	for _, v := range vs {
+		fmt.Printf("%-20s %-20s %-30s %s\n",
+			truncate(v.Rule, 20),
+			truncate(v.Expected, 20),
+			truncate(v.Actual, 30),
+			v.Detail)
+	}
+	fmt.Println()
 }
 
 func (c *Capture) SetPolicy(p *policy.Policy) { c.policy = p }
@@ -233,6 +304,18 @@ func (c *Capture) processData(data []byte) {
 		dstIP = ip.DstIP.String()
 	}
 
+	// Policy: IPv6 запрещён
+	if c.policy != nil && !c.policy.IsIPv6Allowed() {
+		if _, ok := ipLayer.(*layers.IPv6); ok {
+			c.addViolation(policy.Violation{
+				Rule:     "ipv6",
+				Expected: "disabled",
+				Actual:   fmt.Sprintf("%s → %s", srcIP, dstIP),
+				Detail:   "IPv6-трафик при policy.ipv6=false",
+			})
+		}
+	}
+
 	proto := "OTHER"
 	var srcPort, dstPort uint16
 	var tf TCPFlags
@@ -305,12 +388,10 @@ func (c *Capture) processData(data []byte) {
 	if len(payload) > 0 {
 		if (proto == "UDP" && (srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353)) ||
 			(proto == "TCP" && (srcPort == 53 || dstPort == 53)) {
-			fmt.Fprintf(os.Stderr, "[DNS-DBG] srcPort=%d dstPort=%d proto=%s anomaly=%v\n", srcPort, dstPort, proto, c.anomaly != nil)
 			c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
 
 			// Если это запрос (dstPort == 53) — проверяем аномалии
 			if dstPort == 53 {
-				fmt.Fprintf(os.Stderr, "[DNS-DBG] dstPort=53, anomaly=%v\n", c.anomaly != nil)
 			}
 			if (dstPort == 53 || dstPort == 5353) && c.anomaly != nil {
 				if name, qtype, ok := parseDNSQuery(payload); ok {
@@ -429,6 +510,8 @@ func (c *Capture) printAll() {
 	printProxyProcesses(c.flows.Snapshot())
 	c.printAnomalies()
 	c.flows.PrintProfile(c.profileSNI)
+	c.checkDirectOutbound()
+	c.printPolicyViolations()
 	c.printHealth()
 
 	if c.anomaly != nil {

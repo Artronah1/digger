@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"digger/internal/policy"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -27,6 +28,34 @@ type Event struct {
 	Schema int    `json:"schema"`
 	TS     string `json:"ts"`
 	Kind   string `json:"kind"`
+}
+
+type PolicyViolationEvent struct {
+	Event
+	Cycle    int    `json:"cycle"`
+	Rule     string `json:"rule"`
+	Expected string `json:"expected"`
+	Actual   string `json:"actual"`
+	Detail   string `json:"detail"`
+}
+
+func (c *Capture) printPolicyViolationsJSON() {
+	c.violationsMu.Lock()
+	vs := make([]policy.Violation, len(c.violations))
+	copy(vs, c.violations)
+	c.violationsMu.Unlock()
+
+	for _, v := range vs {
+		ev := PolicyViolationEvent{
+			Event:    newEvent("policy_violation"),
+			Cycle:    c.printCycle,
+			Rule:     v.Rule,
+			Expected: v.Expected,
+			Actual:   v.Actual,
+			Detail:   v.Detail,
+		}
+		printJSON(ev)
+	}
 }
 
 func newEvent(kind string) Event {
@@ -165,6 +194,9 @@ func (c *Capture) printAllJSON() {
 	c.printProxyProcessesJSON()
 	c.printAnomaliesJSON()
 	c.printDNSObservationsJSON()
+	// Policy
+	c.checkDirectOutbound()
+	c.printPolicyViolationsJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
