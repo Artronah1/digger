@@ -131,6 +131,7 @@ type FlowStats struct {
 	Hostname string
 	SNI      string
 	ECH      bool
+	JA3      string
 
 	// Timing profile
 	LastPacketTime time.Time
@@ -207,6 +208,7 @@ type AggregatedFlow struct {
 	Recon ReconstructionStatus
 	Class Classification
 	Route netmap.RouteInfo
+	JA3   string
 }
 
 type FlowTable struct {
@@ -414,7 +416,6 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 
 	if sni := extractSNI(f.pendingPayload); sni != "" {
 		if sni == ECHSentinel {
-			// SNI скрыт ECH
 			f.ECH = true
 			f.SNI = ""
 		} else {
@@ -422,6 +423,12 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 		}
 		f.sniExtracted = true
 		f.Recon = ReconComplete
+
+		// JA3 — отпечаток клиента
+		if f.JA3 == "" {
+			f.JA3 = extractJA3(f.pendingPayload)
+		}
+
 		f.pendingPayload = nil
 		return sni
 	}
@@ -589,6 +596,9 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		if f.ECH {
 			g.ECH = true
 		}
+		if g.JA3 == "" && f.JA3 != "" {
+			g.JA3 = f.JA3
+		}
 		if f.LastSeen.After(g.LastSeen) {
 			g.LastSeen = f.LastSeen
 		}
@@ -604,9 +614,6 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 			g.Route = f.Route
 		}
 
-		if f.ECH {
-			g.ECH = true
-		}
 	} // ← вот эта } закрывает for _, f := range flows
 
 	out := make([]AggregatedFlow, 0, len(groups))
