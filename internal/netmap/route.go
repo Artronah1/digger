@@ -1,6 +1,7 @@
 package netmap
 
 import (
+	"net/netip"
 	"os/exec"
 	"strings"
 	"sync"
@@ -37,7 +38,20 @@ func LookupRoute(dstIP string) RouteInfo {
 	}
 	routeCacheMu.Unlock()
 
-	out, err := exec.Command("ip", "route", "get", dstIP).Output()
+	// Определяем версию IP
+	addr, err := netip.ParseAddr(dstIP)
+	if err != nil {
+		return RouteInfo{}
+	}
+
+	var cmd *exec.Cmd
+	if addr.Is6() {
+		cmd = exec.Command("ip", "-6", "route", "get", dstIP)
+	} else {
+		cmd = exec.Command("ip", "route", "get", dstIP)
+	}
+
+	out, err := cmd.Output()
 	if err != nil {
 		return RouteInfo{}
 	}
