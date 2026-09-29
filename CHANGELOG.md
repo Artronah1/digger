@@ -1,3 +1,34 @@
+## [0.6.0] — 2026-09-29
+
+### Добавлено
+
+- **Baseline mode** — `-baseline create|check -baseline-file FILE`.
+  - `create` — снимок доменов, процессов, устройств, JA3/JA4.
+  - `check` — сравнение текущего с baseline. Diff по доменам, процессам, устройствам, JA3/JA4.
+  - Событие `baseline_diff` в JSON.
+- **LAN inventory** — секция `=== Устройства LAN ===` в `-router-mode`.
+  - IP, MAC, Vendor (OUI), Hostname, Conns, Domains, OUT/IN.
+  - Событие `device` в JSON.
+- **`-group-by device`** — расширенный вывод.
+  - Display, IP, MAC, Vendor, Hostname, TopDomains.
+  - Счётчики Direct/Proxy/VPN/Unknown.
+  - Событие `device_group` в JSON.
+- **MAC на ПК** — `FlowTable.localMACs` из `net.InterfaceByName`.
+- **Hostname** — `localHostname` для своего ПК.
+- **JA4 fingerprint** — `ja4` в `flow`. Формат `t13d1517h2_hash_hash`.
+- **Policy Auditor** — `-policy policy.yaml`:
+  - `dns_resolvers` — `⚠POLICY-DNS→IP`.
+  - `allow_direct` — домены, которые должны идти напрямую.
+  - `ipv6` — разрешён или запрещён IPv6.
+  - Секция `⚠ Policy Violations` в тексте.
+  - Событие `policy_violation` в JSON.
+
+### Изменено
+
+- `Baseline` не пишет JA3/JA4 для ClassProxy/ClassVPN (у reality всегда разные).
+- `Baseline` не пишет IP как «процесс» — только `f.Comm`.
+- Baseline-текст только при `-output text`.
+
 ## [0.5.0] — 2026-09-29
 
 ### Добавлено

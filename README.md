@@ -220,6 +220,34 @@ allow_direct:
   - vk.com
 ipv6: false
 ```
+## Baseline mode
+
+`-baseline create|check -baseline-file FILE`.
+
+**Create** — снимок нормального поведения:
+
+```bash
+sudo ./digger -i eth0 -baseline create -baseline-file baseline.json
+```
+
+**Check** — сравнение текущего с baseline:
+
+```bash
+sudo ./digger -i eth0 -baseline check -baseline-file baseline.json
+```
+
+**Что сравнивается:** домены, процессы, устройства, JA3/JA4.
+
+**JSON:** событие `baseline_diff` с `diff_kind`:
+- `new_domain`, `removed_domain`,
+- `new_process`, `removed_process`,
+- `new_device`, `removed_device`,
+- `changed_ja3`, `changed_ja4`, `new_ja3`, `new_ja4`.
+
+```bash
+sudo ./digger -i eth0 -baseline check -baseline-file baseline.json -output json | \
+  jq -c 'select(.kind=="baseline_diff")'
+```
 
 **Правила:**
 
@@ -269,6 +297,8 @@ icecat(19007)   ws.chatgpt.com            ✓      direct   eth0     TCP
 | `-app NAME` | фильтр по имени приложения/устройства |
 | `-output text\|json` | формат вывода: текстовый (по умолчанию) или JSONL |
 | `-policy FILE` | файл политики (policy.yaml) для аудита |
+| `-baseline create\|check` | режим baseline |
+| `-baseline-file FILE` | файл baseline (по умолчанию baseline.json) |
 
 ## JSON output
 
