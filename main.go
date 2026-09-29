@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"digger/internal/baseline"
 	"digger/internal/capture"
 	"digger/internal/netmap"
 	"digger/internal/policy"
@@ -34,6 +35,8 @@ func main() {
 	output := flag.String("output", "text", "формат вывода: text | json")
 	readFile := flag.String("read", "", "читать PCAP-файл вместо live-захвата")
 	policyFile := flag.String("policy", "", "файл политики (policy.yaml) для аудита")
+	baselineMode := flag.String("baseline", "", "режим baseline: create | check")
+	baselineFile := flag.String("baseline-file", "baseline.json", "файл baseline")
 	flag.Parse()
 
 	if *netmapFlag {
@@ -113,6 +116,7 @@ func main() {
 	cap.SetRouterMode(*routerMode)
 	cap.SetOutputMode(*output)
 	cap.SetPolicy(pol)
+	cap.SetGroupBy(*groupBy)
 
 	if *filter != "" {
 		if err := cap.SetFilter(*filter); err != nil {
@@ -146,17 +150,95 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	done := make(chan struct{})
+	go func() {
+		cap.Run()
+		close(done)
+	}()
 
-	if *readFile != "" {
-		// PCAP-режим: читаем файл, потом выходим
-		go func() {
-			cap.RunFromPCAP()
-			close(done)
-		}()
+	// Baseline: create
+	if *baselineMode == "create" {
+		fmt.Fprintf(os.Stderr, "baseline: сбор в течение 60s...\n")
 
+		select {
+		case <-time.After(60 * time.Second):
+		case <-stop:
+			fmt.Fprintln(os.Stderr, "baseline: прервано")
+		}
+
+		cap.Stop()
 		<-done
-		if *output != "json" {
-			fmt.Println("Готово.")
+
+		b := cap.BuildBaseline()
+		if err := baseline.Save(*baselineFile, b); err != nil {
+			log.Fatalf("не удалось сохранить baseline: %v", err)
+		}
+		fmt.Printf("baseline: сохранён в %s (domains=%d, processes=%d, devices=%d)\n",
+			*baselineFile, len(b.Domains), len(b.Processes), len(b.Devices))
+		return
+	}
+
+	// Baseline: check
+	if *baselineMode == "check" {
+		old, err := baseline.Load(*baselineFile)
+		if err != nil {
+			log.Fatalf("не удалось загрузить baseline: %v", err)
+		}
+
+		checkDuration := 30 * time.Second
+		fmt.Fprintf(os.Stderr, "baseline: проверка в течение %s...\n", checkDuration)
+
+		select {
+		case <-time.After(checkDuration):
+		case <-stop:
+			fmt.Fprintln(os.Stderr, "baseline: прервано")
+		}
+
+		cap.Stop()
+		<-done
+
+		current := cap.BuildBaseline()
+		diff := baseline.Compare(old, current)
+
+		if diff.IsEmpty() {
+			fmt.Println("baseline: без изменений")
+		} else {
+			fmt.Printf("baseline: %d различий\n", diff.Total())
+			if len(diff.NewDomains) > 0 {
+				fmt.Printf("\nНовые домены (%d):\n", len(diff.NewDomains))
+				for _, d := range diff.NewDomains {
+					fmt.Printf("  + %s\n", d)
+				}
+			}
+			if len(diff.RemovedDomains) > 0 {
+				fmt.Printf("\nПропавшие домены (%d):\n", len(diff.RemovedDomains))
+				for _, d := range diff.RemovedDomains {
+					fmt.Printf("  - %s\n", d)
+				}
+			}
+			if len(diff.NewProcesses) > 0 {
+				fmt.Printf("\nНовые процессы (%d):\n", len(diff.NewProcesses))
+				for _, p := range diff.NewProcesses {
+					fmt.Printf("  + %s\n", p)
+				}
+			}
+			if len(diff.NewDevices) > 0 {
+				fmt.Printf("\nНовые устройства (%d):\n", len(diff.NewDevices))
+				for _, d := range diff.NewDevices {
+					fmt.Printf("  + %s\n", d)
+				}
+			}
+			if len(diff.ChangedJA3) > 0 {
+				fmt.Printf("\nИзменился JA3 (%d):\n", len(diff.ChangedJA3))
+				for _, c := range diff.ChangedJA3 {
+					fmt.Printf("  ~ %s\n", c)
+				}
+			}
+			if len(diff.ChangedJA4) > 0 {
+				fmt.Printf("\nИзменился JA4 (%d):\n", len(diff.ChangedJA4))
+				for _, c := range diff.ChangedJA4 {
+					fmt.Printf("  ~ %s\n", c)
+				}
+			}
 		}
 		return
 	}

@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
+	"digger/internal/baseline"
 	"digger/internal/policy"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -670,4 +672,67 @@ func isLANIP(ip string) bool {
 		return true
 	}
 	return false
+}
+
+// BuildBaseline собирает снимок текущего состояния.
+func (c *Capture) BuildBaseline() *baseline.Baseline {
+	flows := c.flows.Snapshot()
+
+	domainsSet := make(map[string]bool)
+	procsSet := make(map[string]bool)
+	devicesSet := make(map[string]bool)
+	ja3 := make(map[string]string)
+	ja4 := make(map[string]string)
+
+	for _, f := range flows {
+		// Домены
+		if f.SNI != "" {
+			domainsSet[f.SNI] = true
+		} else if f.Hostname != "" {
+			domainsSet[f.Hostname] = true
+		}
+
+		// Процессы
+		proc := f.Comm
+		if proc == "" {
+			proc = f.Key.LocalIP
+		}
+		if proc != "" {
+			procsSet[proc] = true
+		}
+
+		// Устройства
+		if f.Key.LocalIP != "" {
+			devicesSet[f.Key.LocalIP] = true
+		}
+
+		// JA3/JA4 — по процессу
+		if proc != "" && f.JA3 != "" {
+			ja3[proc] = f.JA3
+		}
+		if proc != "" && f.JA4 != "" {
+			ja4[proc] = f.JA4
+		}
+	}
+
+	return &baseline.Baseline{
+		Schema:    baseline.SchemaVersion,
+		Created:   time.Now().UTC(),
+		Iface:     c.iface,
+		Domains:   sortedKeys(domainsSet),
+		Processes: sortedKeys(procsSet),
+		Devices:   sortedKeys(devicesSet),
+		JA3:       ja3,
+		JA4:       ja4,
+	}
+}
+
+// sortedKeys возвращает отсортированные ключи map.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
