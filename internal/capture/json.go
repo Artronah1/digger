@@ -262,8 +262,13 @@ type DNSObservationEvent struct {
 
 // printDNSObservationsJSON печатает наблюдения DNS с TTL.
 func (c *Capture) printDNSObservationsJSON() {
-	obs := c.dnsMapping.SnapshotObservations()
-	now := time.Now()
+	var obs []DNSObservation
+	if c.dnsAge > 0 {
+		cutoff := time.Now().Add(-c.dnsAge)
+		obs = c.dnsMapping.SnapshotObservationsSince(cutoff)
+	} else {
+		obs = c.dnsMapping.SnapshotObservations()
+	}
 
 	for _, o := range obs {
 		for _, ip := range o.Answers {
@@ -279,7 +284,6 @@ func (c *Capture) printDNSObservationsJSON() {
 				ResolverIP: o.ResolverIP,
 				Transport:  o.Transport,
 			}
-			_ = now
 			printJSON(ev)
 		}
 	}

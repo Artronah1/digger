@@ -568,6 +568,29 @@ func (m *DNSMapping) SnapshotObservations() []DNSObservation {
 	return out
 }
 
+// SnapshotObservationsSince возвращает наблюдения, у которых ObservedAt >= cutoff.
+func (m *DNSMapping) SnapshotObservationsSince(cutoff time.Time) []DNSObservation {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]DNSObservation, 0)
+	seen := make(map[string]bool)
+	for _, list := range m.observations {
+		for _, o := range list {
+			if o.ObservedAt.Before(cutoff) {
+				continue
+			}
+			key := o.QName + "|" + o.ObservedAt.Format(time.RFC3339Nano)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // DNSObservation — одно наблюдение DNS-ответа.
 type DNSObservation struct {
 	QName      string

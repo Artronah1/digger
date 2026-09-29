@@ -34,6 +34,7 @@ type Capture struct {
 	outputMode string // "text" | "json"
 	printCycle int
 	showPTR    bool
+	dnsAge     time.Duration
 	// PCAP-режим
 	pcapReader *pcapgo.Reader
 	pcapFile   *os.File
@@ -93,11 +94,14 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	}, nil
 }
 
-func (c *Capture) SetMinPkts(n int)          { c.flows.SetMinPkts(n) }
-func (c *Capture) SetHideIdle(v bool)        { c.flows.SetHideIdle(v) }
-func (c *Capture) SetActiveOnly(n int)       { c.flows.SetActiveOnly(n) }
-func (c *Capture) SetProfile(sni string)     { c.profileSNI = sni }
-func (c *Capture) SetDNSAge(d time.Duration) { c.dnsTable.SetMaxAge(d) }
+func (c *Capture) SetMinPkts(n int)      { c.flows.SetMinPkts(n) }
+func (c *Capture) SetHideIdle(v bool)    { c.flows.SetHideIdle(v) }
+func (c *Capture) SetActiveOnly(n int)   { c.flows.SetActiveOnly(n) }
+func (c *Capture) SetProfile(sni string) { c.profileSNI = sni }
+func (c *Capture) SetDNSAge(d time.Duration) {
+	c.dnsAge = d
+	c.dnsTable.SetMaxAge(d)
+}
 func (c *Capture) SetShowPTR(v bool) {
 	c.showPTR = v
 	c.dnsTable.SetShowPTR(v)
@@ -314,7 +318,7 @@ func (c *Capture) processData(data []byte) {
 
 			// Если это ответ — строим маппинг name → IP
 			if srcPort == 53 || srcPort == 5353 {
-				c.dnsMapping.Update(payload)
+				c.dnsMapping.Update(payload, dstIP, srcIP) // было Update(payload)
 			}
 		}
 	}
