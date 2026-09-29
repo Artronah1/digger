@@ -83,7 +83,8 @@ type FlowEvent struct {
 	Cycle             int    `json:"cycle"`
 	Label             string `json:"label"` // Идентификатор потока (SNI, Hostname или IP)
 	Process           string `json:"process"`
-	SNI               string `json:"sni,omitempty"`      // Только если Label является настоящим SNI
+	SNI               string `json:"sni,omitempty"` // Только если Label является настоящим SNI
+	Classification    string `json:"classification"`
 	Hostname          string `json:"hostname,omitempty"` // Если Label является hostname
 	RemoteIP          string `json:"remote_ip,omitempty"`
 	RemotePort        uint16 `json:"remote_port,omitempty"`
@@ -100,6 +101,10 @@ type FlowEvent struct {
 	FirstSeen         string `json:"first_seen"`
 	LastSeen          string `json:"last_seen"`
 	CaptureIncomplete bool   `json:"capture_incomplete,omitempty"`
+	RouteInterface    string `json:"route_interface,omitempty"`
+	RouteSrcIP        string `json:"route_src_ip,omitempty"`
+	RouteGateway      string `json:"route_gateway,omitempty"`
+	RouteTable        string `json:"route_table,omitempty"`
 }
 
 // printSnapshotJSON печатает мета о запуске.
@@ -198,6 +203,7 @@ func (c *Capture) printFlowsJSON() {
 			Label:             label,
 			Process:           g.Process,
 			SNI:               sni,
+			Classification:    g.Class.String(),
 			Proto:             g.Proto,
 			Recon:             g.Recon.String(),
 			Conns:             g.Connections,
@@ -211,6 +217,10 @@ func (c *Capture) printFlowsJSON() {
 			FirstSeen:         g.FirstSeen.UTC().Format(time.RFC3339Nano),
 			LastSeen:          g.LastSeen.UTC().Format(time.RFC3339Nano),
 			CaptureIncomplete: incomplete,
+			RouteInterface:    g.Route.Interface,
+			RouteSrcIP:        g.Route.SrcIP,
+			RouteGateway:      g.Route.Gateway,
+			RouteTable:        g.Route.Table,
 		}
 		printJSON(ev)
 	}

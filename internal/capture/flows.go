@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"digger/internal/dns"
+	"digger/internal/netmap"
 	"digger/internal/proc"
 )
 
@@ -174,6 +175,9 @@ type FlowStats struct {
 
 	// Насколько полно реконструирован payload
 	Recon ReconstructionStatus
+
+	// Route attribution
+	Route netmap.RouteInfo
 }
 
 // AggregatedFlow — суммарная статистика по SNI (или remote IP).
@@ -200,6 +204,7 @@ type AggregatedFlow struct {
 
 	Recon ReconstructionStatus
 	Class Classification
+	Route netmap.RouteInfo
 }
 
 type FlowTable struct {
@@ -453,6 +458,11 @@ func (ft *FlowTable) Enrich() {
 			f.Hostname = ft.resolver.Lookup(f.Key.RemoteIP)
 		}
 
+		// Route attribution
+		if f.Route.Interface == "" && f.Key.RemoteIP != "" {
+			f.Route = netmap.LookupRoute(f.Key.RemoteIP)
+		}
+
 		// Классификация: если процесс-прокси и SNI не резолвится — VPN-нода
 		if f.Class == ClassUnknown && f.Comm != "" &&
 			looksLikeProxyProcess(f.Comm) && f.SNI != "" {
@@ -575,6 +585,9 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 			g.WS = f.WindowScale
 			g.MSSKnown = true
 		}
+		if g.Route.Interface == "" && f.Route.Interface != "" {
+			g.Route = f.Route
+		}
 	}
 
 	out := make([]AggregatedFlow, 0, len(groups))
@@ -681,8 +694,8 @@ func (ft *FlowTable) Print() {
 	}
 	fmt.Printf(") ===\n")
 
-	fmt.Printf("%-28s %-32s %-7s %-8s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
-		"PROCESS", "SNI / REMOTE", "RECON", "CLASS", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
+	fmt.Printf("%-28s %-32s %-7s %-8s %-12s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
+		"PROCESS", "SNI / REMOTE", "RECON", "CLASS", "ROUTE", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
 
 	for _, g := range groups {
 		age := time.Since(g.FirstSeen)
@@ -718,11 +731,17 @@ func (ft *FlowTable) Print() {
 		}
 
 		classStr := g.Class.String()
-		fmt.Printf("%-28s %-32s %-7s %-8s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
+		routeStr := g.Route.Interface
+		if routeStr == "" {
+			routeStr = "—"
+		}
+
+		fmt.Printf("%-28s %-32s %-7s %-8s %-12s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
 			truncate(process, 28),
 			label,
 			reconStr,
 			classStr,
+			truncate(routeStr, 12),
 			g.Proto,
 			g.Connections,
 			pktPerSec,
