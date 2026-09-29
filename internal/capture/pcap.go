@@ -57,7 +57,7 @@ func (c *Capture) RunFromPCAP() {
 		}
 
 		data, _, err := c.pcapReader.ReadPacketData()
-		if err == io.EOF {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
 		if err != nil {

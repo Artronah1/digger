@@ -7,3 +7,5 @@
 dist/
 GeoLite2-Country.mmdb
 GeoLite2-Country.mmdb.gz
+
+!internal/capture/testdata/*.pcap

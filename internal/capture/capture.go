@@ -34,6 +34,7 @@ type Capture struct {
 	outputMode string // "text" | "json"
 	printCycle int
 	showPTR    bool
+	quiet      bool
 	dnsAge     time.Duration
 	// PCAP-режим
 	pcapReader *pcapgo.Reader
@@ -96,6 +97,7 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 
 func (c *Capture) SetMinPkts(n int)      { c.flows.SetMinPkts(n) }
 func (c *Capture) SetHideIdle(v bool)    { c.flows.SetHideIdle(v) }
+func (c *Capture) SetQuiet(v bool)       { c.quiet = v }
 func (c *Capture) SetActiveOnly(n int)   { c.flows.SetActiveOnly(n) }
 func (c *Capture) SetProfile(sni string) { c.profileSNI = sni }
 func (c *Capture) SetDNSAge(d time.Duration) {
@@ -389,6 +391,10 @@ func (c *Capture) enrichLoop() {
 }
 
 func (c *Capture) printAll() {
+	if c.quiet {
+		return
+	}
+
 	if c.outputMode == "json" {
 		c.printAllJSON()
 		return
