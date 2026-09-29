@@ -12,6 +12,7 @@ import (
 
 	"digger/internal/capture"
 	"digger/internal/netmap"
+	"digger/internal/policy"
 )
 
 func main() {
@@ -32,11 +33,24 @@ func main() {
 	appFilter := flag.String("app", "", "показывать только это приложение/устройство")
 	output := flag.String("output", "text", "формат вывода: text | json")
 	readFile := flag.String("read", "", "читать PCAP-файл вместо live-захвата")
+	policyFile := flag.String("policy", "", "файл политики (policy.yaml) для аудита")
 	flag.Parse()
 
 	if *netmapFlag {
 		netmap.Collect().Print()
 		return
+	}
+
+	var pol *policy.Policy
+	if *policyFile != "" {
+		var err error
+		pol, err = policy.Load(*policyFile)
+		if err != nil {
+			log.Fatalf("не удалось загрузить политику: %v", err)
+		}
+		if *output != "json" {
+			fmt.Printf("digger: политика загружена из %s\n", *policyFile)
+		}
 	}
 
 	if *iface == "" && *readFile == "" {
@@ -98,6 +112,7 @@ func main() {
 	cap.SetProfile(*profile)
 	cap.SetRouterMode(*routerMode)
 	cap.SetOutputMode(*output)
+	cap.SetPolicy(pol)
 
 	if *filter != "" {
 		if err := cap.SetFilter(*filter); err != nil {

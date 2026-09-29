@@ -3,14 +3,15 @@ package capture
 import (
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"digger/internal/policy"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/huatuo-ai/go-pcap"
-	"os"
 )
 
 type Capture struct {
@@ -39,6 +40,7 @@ type Capture struct {
 	// PCAP-режим
 	pcapReader *pcapgo.Reader
 	pcapFile   *os.File
+	policy     *policy.Policy
 }
 
 type CaptureStats struct {
@@ -123,6 +125,8 @@ func (c *Capture) SetOutputMode(mode string) {
 	}
 	c.outputMode = mode
 }
+
+func (c *Capture) SetPolicy(p *policy.Policy) { c.policy = p }
 
 func (c *Capture) Run() {
 	packets := c.handle.Listen()
@@ -301,10 +305,14 @@ func (c *Capture) processData(data []byte) {
 	if len(payload) > 0 {
 		if (proto == "UDP" && (srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353)) ||
 			(proto == "TCP" && (srcPort == 53 || dstPort == 53)) {
+			fmt.Fprintf(os.Stderr, "[DNS-DBG] srcPort=%d dstPort=%d proto=%s anomaly=%v\n", srcPort, dstPort, proto, c.anomaly != nil)
 			c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
 
 			// Если это запрос (dstPort == 53) — проверяем аномалии
-			if dstPort == 53 && c.anomaly != nil {
+			if dstPort == 53 {
+				fmt.Fprintf(os.Stderr, "[DNS-DBG] dstPort=53, anomaly=%v\n", c.anomaly != nil)
+			}
+			if (dstPort == 53 || dstPort == 5353) && c.anomaly != nil {
 				if name, qtype, ok := parseDNSQuery(payload); ok {
 					if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
 						c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
@@ -314,6 +322,14 @@ func (c *Capture) processData(data []byte) {
 					}
 					if c.anomaly != nil {
 						c.anomaly.RecordDNSOnly(name)
+					}
+					// Policy: разрешён ли резолвер
+					if c.policy != nil {
+						fmt.Fprintf(os.Stderr, "[POLICY-DBG] resolver=%s allowed=%v\n", dstIP, c.policy.IsResolverAllowed(dstIP))
+						if !c.policy.IsResolverAllowed(dstIP) {
+							flag := fmt.Sprintf("⚠POLICY-DNS→%s", dstIP)
+							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
+						}
 					}
 				}
 			}
