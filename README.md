@@ -25,6 +25,8 @@
 - **GeoIP-проверка** — `GeoLite2-Country` для определения страны IP (используется, чтобы не путать российские IP с прокси).
 - **Фильтры шума** (`-min-pkts`, `-hide-idle`, `-active-only`, `-dns-age`).
 - **JSONL output** (`-output json`) — восемь типов событий: `snapshot`, `health`, `flow`, `dns`, `attribution`, `proxy_suspicion`, `proxy_process`, `anomaly`. Схема `schema: 1`.
+- **Route attribution** — для каждого потока виден интерфейс, через который он уходит (`eth0`, `tun0`, `br-lan`), и src-адрес.
+- **Classification** — `DIRECT` / `PROXY` / `VPN` / `UNKNOWN` для каждого потока. VPN-ноды (mihomo, xray) определяются по процессу + SNI.
 
 ## Что показывает
 
@@ -38,6 +40,8 @@
 - **Прокси-трафик** (`⚠PROXY`) — потоки, где SNI не резолвится в удалённый IP, или процесс — известный прокси-клиент, а IP не российский.
 - **Capture Health** — счётчики `received`/`processed`/`truncated`/`decode errors`. Флаг `quality: complete/incomplete`. Под нагрузкой `received == processed` — ноль потерь.
 - **`RECON`** — насколько полно реконструирован payload: `✓` (complete), `⚠part` (partial), `⚠gap` (gap), `?` (unknown). Видно, где SNI **точно** извлекли, а где ClientHello не видели.
+- **Классификация потока** (`CLASS`) — `direct` / `proxy` / `vpn` / `unknown`. Видно, что идёт напрямую, что через прокси, что в VPN-туннель.
+- **Маршрут** (`ROUTE`) — через какой интерфейс уходит поток.
 
 ## Флаги аномалий
 
@@ -182,6 +186,34 @@ APP                            CONNS  DOMAINS        OUT         IN   AGE
 192.168.1.2 (Realtek)             23        8     0.5 MB     3.2 MB   45s
 ```
 
+## Classification и Route
+
+Каждый поток получает **классификацию** и **маршрут**:
+
+| Колонка | Значения | Что значит |
+|---|---|---|
+| `RECON` | `✓` / `⚠part` / `⚠gap` / `?` / `·` | Насколько полно реконструирован payload |
+| `CLASS` | `direct` / `proxy` / `vpn` / `unknown` | Куда идёт поток |
+| `ROUTE` | `eth0` / `tun0` / `br-lan` / … | Через какой интерфейс |
+
+**Classification:**
+
+- **`direct`** — SNI есть, DNS совпал (или CDN-балансировка).
+- **`proxy`** — SNI не резолвится, или процесс-прокси без SNI.
+- **`vpn`** — процесс-прокси (`mihomo`, `xray`) + SNI не резолвится → VPN-нода. Все потоки к тому же IP — тоже `vpn`.
+- **`unknown`** — недостаточно данных.
+
+**Route attribution:** используется `ip route get <ip>`, кэш 30 секунд. Видно, через какой интерфейс уходит поток — `eth0` (прямо), `tun0` (VPN), `br-lan` (LAN).
+
+Пример:
+
+```
+PROCESS         SNI / REMOTE              RECON  CLASS    ROUTE    PROTO
+mihomo(1124) memescollection.com  ✓      vpn      eth0     TCP
+mihomo(1124)    62.233.43.43      ?      vpn      eth0     TCP
+icecat(19007)   ws.chatgpt.com            ✓      direct   eth0     TCP
+```
+
 ## Флаги
 
 | Флаг | Описание |
@@ -213,12 +245,54 @@ APP                            CONNS  DOMAINS        OUT         IN   AGE
 |---|---|
 | `snapshot` | мета о запуске: iface, filter, snaplen, version, uptime |
 | `health` | счётчики Capture Health + quality |
-| `flow` | агрегированный поток: label, sni, process, recon, conns, bytes |
+| `flow` | агрегированный поток: label, sni, process, recon, **classification**, **route_interface**, **route_src_ip**, conns, bytes |
 | `dns` | DNS-запрос: name, qtype, src/dst, transport, count, flags |
 | `attribution` | связка DNS ↔ SNI ↔ IP: status (✓/~/⚠/✗/?), dns_names, reason |
 | `proxy_suspicion` | подозрение на прокси: reason, confidence (process / dns-mismatch / heuristic) |
 | `proxy_process` | агрегат по процессу-прокси: process, conns, bytes, remote_ips |
 | `anomaly` | аномалия: NEW / HASH / BEACON / PROXY / DNS-LEAK |
+
+### Поля `flow`
+
+```json
+{
+  "schema": 1,
+  "ts": "2026-09-29T06:19:23Z",
+  "kind": "flow",
+  "cycle": 1,
+  "label": "memescollection.com",
+  "sni": "memescollection.com",
+  "process": "mihomo(1124)",
+  "proto": "TCP",
+  "recon": "complete",
+  "classification": "vpn",
+  "route_interface": "eth0",
+  "route_src_ip": "192.168.1.79",
+  "route_gateway": "",
+  "route_table": "",
+  "conns": 5,
+  "packets_out": 100,
+  "bytes_out": 35800,
+  "packets_in": 50,
+  "bytes_in": 7800,
+  "retransmits": 0,
+  "gaps": 0,
+  "age_sec": 12,
+  "first_seen": "2026-09-29T06:19:11Z",
+  "last_seen": "2026-09-29T06:19:23Z"
+}
+```
+Пример:
+
+```bash
+sudo ./digger -i eth0 -f "tcp port 443" -output json | jq -c 'select(.kind=="flow") | {label, classification, route_interface}'
+```
+
+```json
+{"label":"**************","classification":"vpn","route_interface":"eth0"}
+{"label":"ws.chatgpt.com","classification":"direct","route_interface":"eth0"}
+{"label":"**************","classification":"unknown","route_interface":"eth0"}
+```
 
 Пример:
 
