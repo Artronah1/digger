@@ -12,6 +12,8 @@ type Diff struct {
 	RemovedDevices   []string
 	ChangedJA3       []string
 	ChangedJA4       []string
+	NewJA3           []string
+	NewJA4           []string
 }
 
 // IsEmpty — нет различий?
@@ -48,7 +50,21 @@ func Compare(old, current *Baseline) *Diff {
 	d.ChangedJA3 = diffMap(old.JA3, current.JA3)
 	d.ChangedJA4 = diffMap(old.JA4, current.JA4)
 
+	d.NewJA3 = diffMapNew(old.JA3, current.JA3)
+	d.NewJA4 = diffMapNew(old.JA4, current.JA4)
+
 	return d
+}
+
+// diffMapNew возвращает "key: new" для ключей, которых не было в old.
+func diffMapNew(old, current map[string]string) []string {
+	var out []string
+	for k, v := range current {
+		if _, ok := old[k]; !ok {
+			out = append(out, fmt.Sprintf("%s: %s", k, v))
+		}
+	}
+	return out
 }
 
 // diffNew возвращает элементы, которые есть в b, но нет в a.

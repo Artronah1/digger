@@ -692,26 +692,24 @@ func (c *Capture) BuildBaseline() *baseline.Baseline {
 			domainsSet[f.Hostname] = true
 		}
 
-		// Процессы
-		proc := f.Comm
-		if proc == "" {
-			proc = f.Key.LocalIP
+		// Процессы (только реальные процессы, не IP)
+		if f.Comm != "" {
+			procsSet[f.Comm] = true
 		}
-		if proc != "" {
-			procsSet[proc] = true
-		}
-
 		// Устройства
 		if f.Key.LocalIP != "" {
 			devicesSet[f.Key.LocalIP] = true
 		}
 
-		// JA3/JA4 — по процессу
-		if proc != "" && f.JA3 != "" {
-			ja3[proc] = f.JA3
-		}
-		if proc != "" && f.JA4 != "" {
-			ja4[proc] = f.JA4
+		// JA3/JA4 — по процессу.
+		// Пропускаем proxy/vpn — у них JA3/JA4 меняется каждый сеанс.
+		if f.Comm != "" && f.Class != ClassProxy && f.Class != ClassVPN {
+			if f.JA3 != "" {
+				ja3[f.Comm] = f.JA3
+			}
+			if f.JA4 != "" {
+				ja4[f.Comm] = f.JA4
+			}
 		}
 	}
 
