@@ -1,3 +1,25 @@
+## [0.4.0] — 2026-09-29
+
+### Добавлено
+
+- **Classification** — итоговая классификация каждого потока: `DIRECT` / `PROXY` / `VPN` / `UNKNOWN`.
+  - `CLASS` в текстовом выводе, `classification` в JSON.
+  - VPN-ноды (`mihomo`, `xray`) определяются по процессу + SNI, который не резолвится.
+  - `vpnIPs` — IP VPN-нод запоминаются, все потоки к ним получают `vpn`.
+- **Route attribution** — для каждого потока виден интерфейс, через который он уходит.
+  - `ROUTE` в текстовом выводе, `route_interface` / `route_src_ip` / `route_gateway` / `route_table` в JSON.
+  - `netmap.LookupRoute()` через `ip route get`, кэш 30 секунд.
+- **`Enrich`** — заполняет `Route` для каждого потока раз в секунду.
+
+### Изменено
+
+- `AppendPayload` больше не проверяет `Comm` (на момент вызова он ещё пуст).
+- `Enrich` выполняет классификацию VPN-нод.
+
+### Исправлено
+
+- Ложное срабатывание `CLASS = vpn` для CDN (`resolveSNIAt` возвращает `different-ip` → `direct`).
+
 ## [0.3.0] — 2026-09-28
 
 ### Добавлено
