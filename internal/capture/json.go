@@ -136,6 +136,7 @@ type FlowEvent struct {
 	RouteTable        string `json:"route_table,omitempty"`
 	ECH               bool   `json:"ech,omitempty"`
 	JA3               string `json:"ja3,omitempty"`
+	JA4               string `json:"ja4,omitempty"`
 }
 
 // printSnapshotJSON печатает мета о запуске.
@@ -301,6 +302,7 @@ func (c *Capture) printFlowsJSON() {
 			RouteTable:        g.Route.Table,
 			ECH:               g.ECH,
 			JA3:               g.JA3,
+			JA4:               g.JA4,
 		}
 		printJSON(ev)
 	}

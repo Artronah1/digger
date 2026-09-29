@@ -132,6 +132,7 @@ type FlowStats struct {
 	SNI      string
 	ECH      bool
 	JA3      string
+	JA4      string
 
 	// Timing profile
 	LastPacketTime time.Time
@@ -209,6 +210,7 @@ type AggregatedFlow struct {
 	Class Classification
 	Route netmap.RouteInfo
 	JA3   string
+	JA4   string
 }
 
 type FlowTable struct {
@@ -445,7 +447,10 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 		if f.JA3 == "" {
 			f.JA3 = extractJA3(f.pendingPayload)
 		}
-
+		// JA4
+		if f.JA4 == "" {
+			f.JA4 = extractJA4(f.pendingPayload)
+		}
 		f.pendingPayload = nil
 		return sni
 	}
@@ -622,6 +627,9 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		}
 		if g.JA3 == "" && f.JA3 != "" {
 			g.JA3 = f.JA3
+		}
+		if g.JA4 == "" && f.JA4 != "" {
+			g.JA4 = f.JA4
 		}
 		if f.LastSeen.After(g.LastSeen) {
 			g.LastSeen = f.LastSeen
