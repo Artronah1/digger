@@ -547,6 +547,27 @@ type DNSMapping struct {
 	observations map[string][]DNSObservation // key = name + "|" + ip
 }
 
+// SnapshotObservations возвращает все наблюдения DNS.
+func (m *DNSMapping) SnapshotObservations() []DNSObservation {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]DNSObservation, 0)
+	seen := make(map[string]bool)
+	for _, list := range m.observations {
+		for _, o := range list {
+			// Дедуп по (qname, observed_at)
+			key := o.QName + "|" + o.ObservedAt.Format(time.RFC3339Nano)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // DNSObservation — одно наблюдение DNS-ответа.
 type DNSObservation struct {
 	QName      string
@@ -699,7 +720,30 @@ func (m *DNSMapping) NamesForIP(ip string) []string {
 }
 
 // Update обрабатывает DNS-ответ и добавляет связи.
-func (m *DNSMapping) Update(payload []byte) {
+func (m *DNSMapping) Update(payload []byte, srcIP, dstIP string) {
+	// Сначала пробуем TTL-версию — она даёт наблюдение
+	name2, ips2, ttl, ok2 := parseDNSResponseTTL(payload)
+	if ok2 {
+		now := time.Now()
+		var expiresAt time.Time
+		if ttl > 0 {
+			expiresAt = now.Add(time.Duration(ttl) * time.Second)
+		} else {
+			expiresAt = now.Add(10 * time.Minute)
+		}
+		m.AddObservation(DNSObservation{
+			QName:      name2,
+			Answers:    ips2,
+			ObservedAt: now,
+			ExpiresAt:  expiresAt,
+			TTL:        ttl,
+			ClientIP:   srcIP,
+			ResolverIP: dstIP,
+			Transport:  "udp/53",
+		})
+	}
+
+	// Потом — старый Add для совместимости
 	name, ips, ok := parseDNSResponse(payload)
 	if !ok {
 		return
@@ -707,26 +751,6 @@ func (m *DNSMapping) Update(payload []byte) {
 	for _, ip := range ips {
 		m.Add(name, ip)
 	}
-
-	// Дополнительно — наблюдение с TTL
-	name2, ips2, ttl, ok2 := parseDNSResponseTTL(payload)
-	if !ok2 {
-		return
-	}
-	now := time.Now()
-	var expiresAt time.Time
-	if ttl > 0 {
-		expiresAt = now.Add(time.Duration(ttl) * time.Second)
-	} else {
-		expiresAt = now.Add(10 * time.Minute)
-	}
-	m.AddObservation(DNSObservation{
-		QName:      name2,
-		Answers:    ips2,
-		ObservedAt: now,
-		ExpiresAt:  expiresAt,
-		TTL:        ttl,
-	})
 }
 
 // Len возвращает число известных пар name → IP.

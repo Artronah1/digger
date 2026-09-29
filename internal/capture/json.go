@@ -162,6 +162,7 @@ func (c *Capture) printAllJSON() {
 	c.printProxySuspicionsJSON()
 	c.printProxyProcessesJSON()
 	c.printAnomaliesJSON()
+	c.printDNSObservationsJSON()
 }
 
 // looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
@@ -240,6 +241,46 @@ type DNSEvent struct {
 	FirstSeen string `json:"first_seen"`
 	LastSeen  string `json:"last_seen"`
 	Flags     string `json:"flags,omitempty"`
+}
+
+// DNSObservationEvent — одно наблюдение DNS-ответа с TTL.
+type DNSObservationEvent struct {
+	Event
+
+	Cycle      int    `json:"cycle"`
+	QName      string `json:"qname"`
+	IP         string `json:"ip"`
+	TTL        uint32 `json:"ttl,omitempty"`
+	ObservedAt string `json:"observed_at"`
+	ExpiresAt  string `json:"expires_at"`
+	ClientIP   string `json:"client_ip,omitempty"`
+	ResolverIP string `json:"resolver_ip,omitempty"`
+	Transport  string `json:"transport,omitempty"`
+}
+
+// printDNSObservationsJSON печатает наблюдения DNS с TTL.
+func (c *Capture) printDNSObservationsJSON() {
+	obs := c.dnsMapping.SnapshotObservations()
+	now := time.Now()
+
+	for _, o := range obs {
+		for _, ip := range o.Answers {
+			ev := DNSObservationEvent{
+				Event:      newEvent("dns_observation"),
+				Cycle:      c.printCycle,
+				QName:      o.QName,
+				IP:         ip,
+				TTL:        o.TTL,
+				ObservedAt: o.ObservedAt.UTC().Format(time.RFC3339Nano),
+				ExpiresAt:  o.ExpiresAt.UTC().Format(time.RFC3339Nano),
+				ClientIP:   o.ClientIP,
+				ResolverIP: o.ResolverIP,
+				Transport:  o.Transport,
+			}
+			_ = now
+			printJSON(ev)
+		}
+	}
 }
 
 // printDNSJSON печатает DNS-запросы.
