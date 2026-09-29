@@ -45,6 +45,7 @@ type Capture struct {
 	policy       *policy.Policy
 	violations   []policy.Violation
 	violationsMu sync.Mutex
+	baselineRef  *baseline.Baseline
 }
 
 type CaptureStats struct {
@@ -112,11 +113,12 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	}, nil
 }
 
-func (c *Capture) SetMinPkts(n int)      { c.flows.SetMinPkts(n) }
-func (c *Capture) SetHideIdle(v bool)    { c.flows.SetHideIdle(v) }
-func (c *Capture) SetQuiet(v bool)       { c.quiet = v }
-func (c *Capture) SetActiveOnly(n int)   { c.flows.SetActiveOnly(n) }
-func (c *Capture) SetProfile(sni string) { c.profileSNI = sni }
+func (c *Capture) SetMinPkts(n int)                 { c.flows.SetMinPkts(n) }
+func (c *Capture) SetHideIdle(v bool)               { c.flows.SetHideIdle(v) }
+func (c *Capture) SetQuiet(v bool)                  { c.quiet = v }
+func (c *Capture) SetActiveOnly(n int)              { c.flows.SetActiveOnly(n) }
+func (c *Capture) SetProfile(sni string)            { c.profileSNI = sni }
+func (c *Capture) SetBaseline(b *baseline.Baseline) { c.baselineRef = b }
 func (c *Capture) SetDNSAge(d time.Duration) {
 	c.dnsAge = d
 	c.dnsTable.SetMaxAge(d)
@@ -506,6 +508,10 @@ func (c *Capture) enrichLoop() {
 func (c *Capture) printAll() {
 	if c.quiet {
 		return
+	}
+
+	if c.baselineRef != nil {
+		c.printBaselineDiffJSON(c.baselineRef)
 	}
 
 	if c.outputMode == "json" {

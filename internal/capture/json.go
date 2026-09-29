@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"digger/internal/baseline"
 	"digger/internal/policy"
 	"encoding/json"
 	"fmt"
@@ -105,6 +106,16 @@ type HealthEvent struct {
 	Quality          string `json:"quality"`
 }
 
+// BaselineDiffEvent — различие с baseline.
+type BaselineDiffEvent struct {
+	Event
+	Cycle    int    `json:"cycle"`
+	Kind     string `json:"diff_kind"` // "new_domain", "removed_domain", "new_process", ...
+	Value    string `json:"value"`
+	OldValue string `json:"old_value,omitempty"`
+	NewValue string `json:"new_value,omitempty"`
+}
+
 // FlowEvent — один агрегированный поток.
 type FlowEvent struct {
 	Event
@@ -151,6 +162,68 @@ func (c *Capture) printSnapshotJSON() {
 		Uptime:  int64(time.Since(c.stats.StartedAt).Seconds()),
 	}
 	printJSON(ev)
+}
+
+// printBaselineDiffJSON печатает различия с baseline.
+func (c *Capture) printBaselineDiffJSON(old *baseline.Baseline) {
+	current := c.BuildBaseline()
+	diff := baseline.Compare(old, current)
+
+	printDiffs := func(kind string, values []string) {
+		for _, v := range values {
+			ev := BaselineDiffEvent{
+				Event: newEvent("baseline_diff"),
+				Cycle: c.printCycle,
+				Kind:  kind,
+				Value: v,
+			}
+			printJSON(ev)
+		}
+	}
+
+	printDiffs("new_domain", diff.NewDomains)
+	printDiffs("removed_domain", diff.RemovedDomains)
+	printDiffs("new_process", diff.NewProcesses)
+	printDiffs("removed_process", diff.RemovedProcesses)
+	printDiffs("new_device", diff.NewDevices)
+	printDiffs("removed_device", diff.RemovedDevices)
+
+	for _, v := range diff.ChangedJA3 {
+		ev := BaselineDiffEvent{
+			Event: newEvent("baseline_diff"),
+			Cycle: c.printCycle,
+			Kind:  "changed_ja3",
+			Value: v,
+		}
+		printJSON(ev)
+	}
+	for _, v := range diff.ChangedJA4 {
+		ev := BaselineDiffEvent{
+			Event: newEvent("baseline_diff"),
+			Cycle: c.printCycle,
+			Kind:  "changed_ja4",
+			Value: v,
+		}
+		printJSON(ev)
+	}
+	for _, v := range diff.NewJA3 {
+		ev := BaselineDiffEvent{
+			Event: newEvent("baseline_diff"),
+			Cycle: c.printCycle,
+			Kind:  "new_ja3",
+			Value: v,
+		}
+		printJSON(ev)
+	}
+	for _, v := range diff.NewJA4 {
+		ev := BaselineDiffEvent{
+			Event: newEvent("baseline_diff"),
+			Cycle: c.printCycle,
+			Kind:  "new_ja4",
+			Value: v,
+		}
+		printJSON(ev)
+	}
 }
 
 // DeviceEvent — событие об устройстве LAN.

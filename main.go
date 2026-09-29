@@ -172,14 +172,17 @@ func main() {
 		if err := baseline.Save(*baselineFile, b); err != nil {
 			log.Fatalf("не удалось сохранить baseline: %v", err)
 		}
+		if *output != "json" {
 		fmt.Printf("baseline: сохранён в %s (domains=%d, processes=%d, devices=%d)\n",
 			*baselineFile, len(b.Domains), len(b.Processes), len(b.Devices))
 		return
 	}
+}
 
 	// Baseline: check
 	if *baselineMode == "check" {
 		old, err := baseline.Load(*baselineFile)
+		cap.SetBaseline(old)
 		if err != nil {
 			log.Fatalf("не удалось загрузить baseline: %v", err)
 		}
@@ -199,6 +202,7 @@ func main() {
 		current := cap.BuildBaseline()
 		diff := baseline.Compare(old, current)
 
+	if *output != "json" {
 		if diff.IsEmpty() {
 			fmt.Println("baseline: без изменений")
 		} else {
@@ -242,6 +246,7 @@ func main() {
 		}
 		return
 	}
+}
 
 	// Live-режим: ждём Ctrl+C
 	go func() {
