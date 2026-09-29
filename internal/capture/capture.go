@@ -8,7 +8,9 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcapgo"
 	"github.com/huatuo-ai/go-pcap"
+	"os"
 )
 
 type Capture struct {
@@ -32,6 +34,9 @@ type Capture struct {
 	outputMode string // "text" | "json"
 	printCycle int
 	showPTR    bool
+	// PCAP-режим
+	pcapReader *pcapgo.Reader
+	pcapFile   *os.File
 }
 
 type CaptureStats struct {
@@ -144,7 +149,7 @@ func (c *Capture) Run() {
 			if !ok {
 				return
 			}
-			c.process(pkt)
+			c.processData(pkt.B)
 		}
 	}
 }
@@ -157,11 +162,16 @@ func (c *Capture) Stop() {
 
 func (c *Capture) Close() {
 	c.Stop()
-	c.handle.Close()
+	if c.handle != nil {
+		c.handle.Close()
+	}
+	if c.pcapFile != nil {
+		c.pcapFile.Close()
+	}
+	CloseGeoIP()
 }
 
-func (c *Capture) process(pkt pcap.Packet) {
-	data := pkt.B
+func (c *Capture) processData(data []byte) {
 
 	c.stats.mu.Lock()
 	c.stats.PacketsReceived++

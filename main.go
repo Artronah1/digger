@@ -31,6 +31,7 @@ func main() {
 	groupBy := flag.String("group-by", "", "группировать по: app | device")
 	appFilter := flag.String("app", "", "показывать только это приложение/устройство")
 	output := flag.String("output", "text", "формат вывода: text | json")
+	readFile := flag.String("read", "", "читать PCAP-файл вместо live-захвата")
 	flag.Parse()
 
 	if *netmapFlag {
@@ -38,8 +39,8 @@ func main() {
 		return
 	}
 
-	if *iface == "" {
-		fmt.Fprintln(os.Stderr, "ошибка: укажите интерфейс через -i")
+	if *iface == "" && *readFile == "" {
+		fmt.Fprintln(os.Stderr, "ошибка: укажите -i <интерфейс> или -read <файл.pcap>")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -72,9 +73,18 @@ func main() {
 		os.Stdout = origStdout
 	}()
 
-	cap, err := capture.New(*iface, *snaplen, *verbose)
-	if err != nil {
-		log.Fatalf("не удалось открыть интерфейс %s: %v", *iface, err)
+	var cap *capture.Capture
+
+	if *readFile != "" {
+		cap, err = capture.NewFromPCAP(*readFile, *verbose)
+		if err != nil {
+			log.Fatalf("не удалось открыть PCAP %s: %v", *readFile, err)
+		}
+	} else {
+		cap, err = capture.New(*iface, *snaplen, *verbose)
+		if err != nil {
+			log.Fatalf("не удалось открыть интерфейс %s: %v", *iface, err)
+		}
 	}
 	defer cap.Close()
 
@@ -96,27 +106,47 @@ func main() {
 	}
 
 	if *output != "json" {
-		fmt.Printf("digger: захват на %s", *iface)
-		if *filter != "" {
-			fmt.Printf(", фильтр: %s", *filter)
+		if *readFile != "" {
+			fmt.Printf("digger: чтение PCAP %s\n", *readFile)
+		} else {
+			fmt.Printf("digger: захват на %s", *iface)
+			if *filter != "" {
+				fmt.Printf(", фильтр: %s", *filter)
+			}
+			fmt.Printf(", min-pkts: %d\n", *minPkts)
+			if *groupBy != "" {
+				fmt.Printf(", группировка: %s\n", *groupBy)
+			}
+			if *appFilter != "" {
+				fmt.Printf(", фильтр приложения: %s\n", *appFilter)
+			}
+			if *activeOnly > 0 {
+				fmt.Printf(", active-only: %d сек\n", *activeOnly)
+			}
+			fmt.Println("Нажмите Ctrl+C для остановки...")
 		}
-		fmt.Printf(", min-pkts: %d\n", *minPkts)
-		if *groupBy != "" {
-			fmt.Printf(", группировка: %s\n", *groupBy)
-		}
-		if *appFilter != "" {
-			fmt.Printf(", фильтр приложения: %s\n", *appFilter)
-		}
-		if *activeOnly > 0 {
-			fmt.Printf(", active-only: %d сек\n", *activeOnly)
-		}
-		fmt.Println("Нажмите Ctrl+C для остановки...")
 	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	done := make(chan struct{})
+
+	if *readFile != "" {
+		// PCAP-режим: читаем файл, потом выходим
+		go func() {
+			cap.RunFromPCAP()
+			close(done)
+		}()
+
+		<-done
+		if *output != "json" {
+			fmt.Println("Готово.")
+		}
+		return
+	}
+
+	// Live-режим: ждём Ctrl+C
 	go func() {
 		cap.Run()
 		close(done)
