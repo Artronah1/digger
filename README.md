@@ -27,6 +27,10 @@
 - **JSONL output** (`-output json`) — восемь типов событий: `snapshot`, `health`, `flow`, `dns`, `attribution`, `proxy_suspicion`, `proxy_process`, `anomaly`. Схема `schema: 1`.
 - **Route attribution** — для каждого потока виден интерфейс, через который он уходит (`eth0`, `tun0`, `br-lan`), и src-адрес.
 - **Classification** — `DIRECT` / `PROXY` / `VPN` / `UNKNOWN` для каждого потока. VPN-ноды (mihomo, xray) определяются по процессу + SNI.
+- **Policy Auditor** (`-policy policy.yaml`) — проверка реального поведения против ожидаемого.
+- **JA3 fingerprint** — TLS-отпечаток клиента.
+- **ECH detection** — определение Encrypted ClientHello.
+- **PCAP reading** (`-read file.pcap`) — анализ сохранённых захватов.
 
 ## Что показывает
 
@@ -203,6 +207,36 @@ APP                            CONNS  DOMAINS        OUT         IN   AGE
 - **`vpn`** — процесс-прокси (`mihomo`, `xray`) + SNI не резолвится → VPN-нода. Все потоки к тому же IP — тоже `vpn`.
 - **`unknown`** — недостаточно данных.
 
+## Policy Auditor
+
+`-policy policy.yaml` — проверка реального поведения против ожидаемого.
+
+```yaml
+# policy.yaml
+dns_resolvers:
+  - 192.168.1.1
+allow_direct:
+  - ozon.ru
+  - vk.com
+ipv6: false
+```
+
+**Правила:**
+
+| Правило | Что проверяет |
+|---|---|
+| `dns_resolvers` | DNS только через разрешённые резолверы → `⚠POLICY-DNS→IP` |
+| `allow_direct` | Домены, которые должны идти напрямую. Если класс ≠ direct → violation |
+| `ipv6` | Разрешён или запрещён IPv6-трафик |
+
+**Секция** `⚠ Policy Violations` в тексте. **Событие** `policy_violation` в JSON.
+
+## JA3 fingerprint
+
+`ja3` в JSON-событии `flow` — TLS-отпечаток клиента. MD5 от version, ciphers, extensions, curves, formats.
+
+Один и тот же клиент (Firefox) → один JA3 для разных SNI.
+
 **Route attribution:** используется `ip route get <ip>`, кэш 30 секунд. Видно, через какой интерфейс уходит поток — `eth0` (прямо), `tun0` (VPN), `br-lan` (LAN).
 
 Пример:
@@ -234,6 +268,7 @@ icecat(19007)   ws.chatgpt.com            ✓      direct   eth0     TCP
 | `-group-by app\|device` | группировать по приложениям или устройствам |
 | `-app NAME` | фильтр по имени приложения/устройства |
 | `-output text\|json` | формат вывода: текстовый (по умолчанию) или JSONL |
+| `-policy FILE` | файл политики (policy.yaml) для аудита |
 
 ## JSON output
 

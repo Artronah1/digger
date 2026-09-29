@@ -1,3 +1,35 @@
+## [0.5.0] — 2026-09-29
+
+### Добавлено
+
+- **Policy Auditor** — `-policy policy.yaml`. Проверка реального поведения против ожидаемого.
+  - `dns_resolvers` — разрешённые DNS-резолверы. `⚠POLICY-DNS→IP` в таблице DNS.
+  - `allow_direct` — домены, которые должны идти напрямую. Если `class != direct` → violation.
+  - `ipv6` — разрешён или запрещён IPv6-трафик.
+  - Секция `⚠ Policy Violations` в текстовом выводе.
+  - Событие `policy_violation` в JSON: rule, expected, actual, detail.
+- **JA3 fingerprint** — TLS-отпечаток клиента (MD5 от version, ciphers, extensions, curves, formats). Поле `ja3` в `flow`.
+- **ECH detection** — `extractSNI` возвращает `ECHSentinel` при extension `0xfe0d`. `RECON = ech`, `CLASS = direct`.
+- **PCAP reading** — флаг `-read file.pcap`. `processData(data []byte)` работает и для live, и для файла.
+- **PCAP regression suite** — `internal/capture/testdata/dns.pcap` + `regression_test.go`.
+- **`dns_observation`** — наблюдения DNS с TTL. Фильтр по `-dns-age`.
+- **IPv6 route** — `netmap.LookupRoute` определяет версию IP, использует `ip -6 route get`.
+- **`Capture.SetQuiet`** — отключение вывода в тестах.
+
+### Изменено
+
+- `process(pkt pcap.Packet)` → `processData(data []byte)`.
+- SNI: убран `isOutbound` — ClientHello всегда `dstPort = 443`.
+- `ClassifyFlow` вызывается в `Enrich` для `ClassUnknown`.
+- `AddObservation` не выходит до `parseDNSResponse`.
+- `SetFlags` в `DNSTable` ищет по `udp/53`, `tcp/53`, `mdns`.
+
+### Исправлено
+
+- `io.ErrUnexpectedEOF` в PCAP — не считается ошибкой.
+- `dns_observation` создаётся для CNAME/NXDomain/HTTPS без A.
+- `SetFlags` находит флаги для `mdns` (5353).
+
 ## [0.4.0] — 2026-09-29
 
 ### Добавлено
