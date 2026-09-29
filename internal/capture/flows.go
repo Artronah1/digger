@@ -226,6 +226,8 @@ type FlowTable struct {
 
 	vpnIPs    map[string]bool
 	localMACs map[string]string
+
+	groupByDevice bool
 }
 
 func NewFlowTable() *FlowTable {
@@ -238,6 +240,12 @@ func NewFlowTable() *FlowTable {
 		vpnIPs:    make(map[string]bool),
 		localMACs: make(map[string]string),
 	}
+}
+
+func (ft *FlowTable) SetGroupByDevice(v bool) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.groupByDevice = v
 }
 
 func (ft *FlowTable) SetMinPkts(n int)      { ft.mu.Lock(); ft.minPkts = n; ft.mu.Unlock() }
@@ -971,15 +979,29 @@ func printHistogram(label string, count, total uint64) {
 
 // AggregatedApp — суммарная статистика по приложению/устройству.
 type AggregatedApp struct {
-	Process     string
+	Process  string
+	Display  string // человекочитаемое: "192.168.1.42 Xiaomi (phone.local)"
+	IP       string // для device-режима
+	MAC      string
+	Vendor   string
+	Hostname string
+
 	Connections int
 	Domains     int
-	PacketsOut  uint64
-	BytesOut    uint64
-	PacketsIn   uint64
-	BytesIn     uint64
-	FirstSeen   time.Time
-	LastSeen    time.Time
+	TopDomains  []string // топ-5 доменов
+
+	// Классификация
+	Direct  int
+	Proxy   int
+	VPN     int
+	Unknown int
+
+	PacketsOut uint64
+	BytesOut   uint64
+	PacketsIn  uint64
+	BytesIn    uint64
+	FirstSeen  time.Time
+	LastSeen   time.Time
 }
 
 // AggregateByApp группирует потоки по процессу (или устройству).
@@ -987,23 +1009,56 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 	flows := ft.Snapshot()
 
 	groups := make(map[string]*AggregatedApp)
-	domainsByApp := make(map[string]map[string]bool)
+	domainsByApp := make(map[string]map[string]int)
+	classesByApp := make(map[string]map[string]int)
 
 	for i := range flows {
 		f := &flows[i]
 
-		// Определяем "приложение"
-		var process string
-		if f.Comm != "" {
-			process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
-		} else if mac, ok := ft.arpTable[f.Key.LocalIP]; ok {
-			process = fmt.Sprintf("%s (%s)", f.Key.LocalIP, proc.DescribeMAC(mac))
+		// Определяем "приложение" или "устройство"
+		var process, display, ip, mac, vendor, hostname string
+
+		if ft.groupByDevice {
+			// device-режим: группировка по IP устройства
+			ip = f.Key.LocalIP
+			process = ip
+
+			// MAC
+			mac = ft.arpTable[ip]
+			if mac == "" {
+				mac = ft.localMACs[ip]
+			}
+			if mac != "" {
+				vendor = proc.DescribeMAC(mac)
+			}
+
+			// Hostname
+			if f.Hostname != "" {
+				hostname = f.Hostname
+			}
+
+			// Display
+			display = ip
+			if vendor != "" && vendor != "unknown" {
+				display += " " + vendor
+			}
+			if hostname != "" {
+				display += " (" + hostname + ")"
+			}
 		} else {
-			process = f.Key.LocalIP
+			// app-режим
+			if f.Comm != "" {
+				process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+			} else if m, ok := ft.arpTable[f.Key.LocalIP]; ok {
+				process = fmt.Sprintf("%s (%s)", f.Key.LocalIP, proc.DescribeMAC(m))
+			} else {
+				process = f.Key.LocalIP
+			}
+			display = process
 		}
 
 		// Фильтр по приложению
-		if ft.appFilter != "" && !strings.Contains(process, ft.appFilter) {
+		if ft.appFilter != "" && !strings.Contains(display, ft.appFilter) {
 			continue
 		}
 
@@ -1016,10 +1071,16 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 		if !ok {
 			g = &AggregatedApp{
 				Process:   process,
+				Display:   display,
+				IP:        ip,
+				MAC:       mac,
+				Vendor:    vendor,
+				Hostname:  hostname,
 				FirstSeen: f.FirstSeen,
 			}
 			groups[process] = g
-			domainsByApp[process] = make(map[string]bool)
+			domainsByApp[process] = make(map[string]int)
+			classesByApp[process] = make(map[string]int)
 		}
 
 		g.Connections++
@@ -1043,14 +1104,52 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 		if label == "" {
 			label = f.Key.RemoteIP
 		}
-		domainsByApp[process][label] = true
+		domainsByApp[process][label]++
+		classesByApp[process][string(f.Class)]++
 	}
 
 	out := make([]AggregatedApp, 0, len(groups))
 	for name, g := range groups {
 		g.Domains = len(domainsByApp[name])
+
+		// Топ-5 доменов по количеству
+		top := make([]string, 0)
+		type kv struct {
+			k string
+			v int
+		}
+		var pairs []kv
+		for k, v := range domainsByApp[name] {
+			pairs = append(pairs, kv{k, v})
+		}
+		sort.Slice(pairs, func(i, j int) bool {
+			return pairs[i].v > pairs[j].v
+		})
+		for i, p := range pairs {
+			if i >= 5 {
+				break
+			}
+			top = append(top, p.k)
+		}
+		g.TopDomains = top
+
+		// Классификация
+		for cls, n := range classesByApp[name] {
+			switch cls {
+			case "direct":
+				g.Direct = n
+			case "proxy":
+				g.Proxy = n
+			case "vpn":
+				g.VPN = n
+			default:
+				g.Unknown = n
+			}
+		}
+
 		out = append(out, *g)
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].BytesIn+out[i].BytesOut > out[j].BytesIn+out[j].BytesOut
 	})
@@ -1064,19 +1163,57 @@ func (ft *FlowTable) PrintApps() {
 		return
 	}
 
-	fmt.Printf("\n=== Приложения / устройства (%d) ===\n", len(apps))
-	fmt.Printf("%-28s %7s %8s %10s %10s %5s\n",
-		"APP", "CONNS", "DOMAINS", "OUT", "IN", "AGE")
+	title := "Приложения"
+	if ft.groupByDevice {
+		title = "Устройства"
+	}
+
+	fmt.Printf("\n=== %s (%d) ===\n", title, len(apps))
+
+	if ft.groupByDevice {
+		fmt.Printf("%-16s %-18s %-14s %6s %6s %5s %5s %5s %10s %10s %6s\n",
+			"IP", "MAC", "HOSTNAME", "CONNS", "DOMAINS", "DIR", "PRX", "VPN", "OUT", "IN", "AGE")
+	} else {
+		fmt.Printf("%-28s %6s %6s %5s %5s %5s %10s %10s %6s\n",
+			"APP", "CONNS", "DOMAINS", "DIR", "PRX", "VPN", "OUT", "IN", "AGE")
+	}
 
 	for _, a := range apps {
 		age := time.Since(a.FirstSeen).Truncate(time.Second)
-		fmt.Printf("%-28s %7d %8d %10s %10s %5s\n",
-			truncate(a.Process, 28),
-			a.Connections,
-			a.Domains,
-			humanBytes(a.BytesOut),
-			humanBytes(a.BytesIn),
-			age)
+
+		if ft.groupByDevice {
+			mac := a.MAC
+			if mac == "" {
+				mac = "—"
+			}
+			hostname := a.Hostname
+			if hostname == "" {
+				hostname = "—"
+			}
+			fmt.Printf("%-16s %-18s %-14s %6d %6d %5d %5d %5d %10s %10s %6s\n",
+				truncate(a.IP, 16),
+				truncate(mac, 18),
+				truncate(hostname, 14),
+				a.Connections,
+				a.Domains,
+				a.Direct,
+				a.Proxy,
+				a.VPN,
+				humanBytes(a.BytesOut),
+				humanBytes(a.BytesIn),
+				age.String())
+		} else {
+			fmt.Printf("%-28s %6d %6d %5d %5d %5d %10s %10s %6s\n",
+				truncate(a.Display, 28),
+				a.Connections,
+				a.Domains,
+				a.Direct,
+				a.Proxy,
+				a.VPN,
+				humanBytes(a.BytesOut),
+				humanBytes(a.BytesIn),
+				age.String())
+		}
 	}
 	fmt.Println()
 }

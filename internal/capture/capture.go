@@ -121,7 +121,10 @@ func (c *Capture) SetShowPTR(v bool) {
 	c.showPTR = v
 	c.dnsTable.SetShowPTR(v)
 }
-func (c *Capture) SetGroupBy(s string)   { c.groupBy = s }
+func (c *Capture) SetGroupBy(s string) {
+	c.groupBy = s
+	c.flows.SetGroupByDevice(s == "device")
+}
 func (c *Capture) SetAppFilter(s string) { c.appFilter = s; c.flows.SetAppFilter(s) }
 func (c *Capture) SetRouterMode(v bool)  { c.routerMode = v }
 
