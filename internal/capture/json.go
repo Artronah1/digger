@@ -236,6 +236,7 @@ func (c *Capture) printAllJSON() {
 	c.printProxyProcessesJSON()
 	c.printAnomaliesJSON()
 	c.printDNSObservationsJSON()
+	c.printDeviceGroupsJSON()
 	c.printDevicesJSON()
 	c.checkDirectOutbound()
 	c.printPolicyViolationsJSON()
@@ -319,6 +320,68 @@ type DNSEvent struct {
 	FirstSeen string `json:"first_seen"`
 	LastSeen  string `json:"last_seen"`
 	Flags     string `json:"flags,omitempty"`
+}
+
+// DeviceGroupEvent — агрегат по устройству/приложению.
+type DeviceGroupEvent struct {
+	Event
+
+	Cycle    int    `json:"cycle"`
+	GroupBy  string `json:"group_by"` // "app" | "device"
+	Process  string `json:"process"`  // для app-режима
+	Display  string `json:"display"`
+	IP       string `json:"ip,omitempty"`
+	MAC      string `json:"mac,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+
+	Conns      int      `json:"conns"`
+	Domains    int      `json:"domains"`
+	TopDomains []string `json:"top_domains,omitempty"`
+
+	Direct  int `json:"direct"`
+	Proxy   int `json:"proxy"`
+	VPN     int `json:"vpn"`
+	Unknown int `json:"unknown"`
+
+	BytesOut  uint64 `json:"bytes_out"`
+	BytesIn   uint64 `json:"bytes_in"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+}
+
+// printDeviceGroupsJSON печатает агрегаты по устройству/приложению.
+func (c *Capture) printDeviceGroupsJSON() {
+	if c.groupBy != "app" && c.groupBy != "device" {
+		return
+	}
+
+	groups := c.flows.AggregateByApp()
+	for _, g := range groups {
+		ev := DeviceGroupEvent{
+			Event:      newEvent("device_group"),
+			Cycle:      c.printCycle,
+			GroupBy:    c.groupBy,
+			Process:    g.Process,
+			Display:    g.Display,
+			IP:         g.IP,
+			MAC:        g.MAC,
+			Vendor:     g.Vendor,
+			Hostname:   g.Hostname,
+			Conns:      g.Connections,
+			Domains:    g.Domains,
+			TopDomains: g.TopDomains,
+			Direct:     g.Direct,
+			Proxy:      g.Proxy,
+			VPN:        g.VPN,
+			Unknown:    g.Unknown,
+			BytesOut:   g.BytesOut,
+			BytesIn:    g.BytesIn,
+			FirstSeen:  g.FirstSeen.UTC().Format(time.RFC3339Nano),
+			LastSeen:   g.LastSeen.UTC().Format(time.RFC3339Nano),
+		}
+		printJSON(ev)
+	}
 }
 
 // DNSObservationEvent — одно наблюдение DNS-ответа с TTL.
