@@ -130,6 +130,7 @@ type FlowStats struct {
 
 	Hostname string
 	SNI      string
+	ECH      bool
 
 	// Timing profile
 	LastPacketTime time.Time
@@ -201,6 +202,7 @@ type AggregatedFlow struct {
 	MSS      uint16
 	WS       uint8
 	MSSKnown bool
+	ECH      bool
 
 	Recon ReconstructionStatus
 	Class Classification
@@ -411,7 +413,13 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 	}
 
 	if sni := extractSNI(f.pendingPayload); sni != "" {
-		f.SNI = sni
+		if sni == ECHSentinel {
+			// SNI скрыт ECH
+			f.ECH = true
+			f.SNI = ""
+		} else {
+			f.SNI = sni
+		}
 		f.sniExtracted = true
 		f.Recon = ReconComplete
 		f.pendingPayload = nil
@@ -578,6 +586,9 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		}
 		g.Gaps += f.Gaps
 
+		if f.ECH {
+			g.ECH = true
+		}
 		if f.LastSeen.After(g.LastSeen) {
 			g.LastSeen = f.LastSeen
 		}
@@ -592,7 +603,11 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		if g.Route.Interface == "" && f.Route.Interface != "" {
 			g.Route = f.Route
 		}
-	}
+
+		if f.ECH {
+			g.ECH = true
+		}
+	} // ← вот эта } закрывает for _, f := range flows
 
 	out := make([]AggregatedFlow, 0, len(groups))
 	for _, g := range groups {
@@ -720,20 +735,23 @@ func (ft *FlowTable) Print() {
 
 		reconStr := "—"
 		if g.Proto == "TCP" {
-			switch g.Recon {
-			case ReconComplete:
-				reconStr = "✓"
-			case ReconPartial:
-				reconStr = "⚠part"
-			case ReconGap:
-				reconStr = "⚠gap"
-			case ReconEmpty:
-				reconStr = "·"
-			case ReconUnknown:
-				reconStr = "?"
+			if g.ECH {
+				reconStr = "ech"
+			} else {
+				switch g.Recon {
+				case ReconComplete:
+					reconStr = "✓"
+				case ReconPartial:
+					reconStr = "⚠part"
+				case ReconGap:
+					reconStr = "⚠gap"
+				case ReconEmpty:
+					reconStr = "·"
+				case ReconUnknown:
+					reconStr = "?"
+				}
 			}
 		}
-
 		classStr := g.Class.String()
 		routeStr := g.Route.Interface
 		if routeStr == "" {
@@ -1110,6 +1128,10 @@ func (ft *FlowTable) MarkVPN(srcIP string, srcPort uint16, dstIP string, dstPort
 // ClassifyFlow определяет итоговую классификацию потока.
 // mapping используется для проверки SNI ↔ DNS. Может быть nil.
 func ClassifyFlow(f *FlowStats, mapping *DNSMapping) Classification {
+	// 0. ECH — SNI скрыт, но это не прокси
+	if f.ECH {
+		return ClassDirect
+	}
 	// 1. VPN — если детектор сработал
 	if f.VPNProto != "" {
 		return ClassVPN

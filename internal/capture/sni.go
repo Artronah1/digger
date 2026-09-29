@@ -4,8 +4,12 @@ import (
 	"encoding/binary"
 )
 
+// ECHSentinel — маркер, что SNI скрыт ECH.
+const ECHSentinel = "__ECH__"
+
 // extractSNI достаёт server_name из TLS ClientHello.
 // Возвращает "" если это не ClientHello или SNI отсутствует.
+// Возвращает ECHSentinel если ClientHello есть, но SNI скрыт ECH (extension 0xfe0d).
 func extractSNI(payload []byte) string {
 	if len(payload) < 5 {
 		return ""
@@ -57,6 +61,9 @@ func extractSNI(payload []byte) string {
 		end = len(body)
 	}
 
+	sni := ""
+	hasECH := false
+
 	// Идём по расширениям: type(2) length(2) data
 	for pos+4 <= end {
 		extType := binary.BigEndian.Uint16(body[pos : pos+2])
@@ -65,7 +72,8 @@ func extractSNI(payload []byte) string {
 		if pos+extLen > end {
 			break
 		}
-		if extType == 0x0000 { // server_name
+		switch extType {
+		case 0x0000: // server_name
 			data := body[pos : pos+extLen]
 			if len(data) < 5 {
 				break
@@ -74,10 +82,18 @@ func extractSNI(payload []byte) string {
 			if len(data) < 5+nameLen {
 				break
 			}
-			return string(data[5 : 5+nameLen])
+			sni = string(data[5 : 5+nameLen])
+		case 0xfe0d: // encrypted_client_hello
+			hasECH = true
 		}
 		pos += extLen
 	}
 
+	if sni != "" {
+		return sni
+	}
+	if hasECH {
+		return ECHSentinel
+	}
 	return ""
 }
