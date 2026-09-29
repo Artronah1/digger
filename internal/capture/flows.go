@@ -224,8 +224,9 @@ type FlowTable struct {
 	activeOnly int
 	appFilter  string
 
-	vpnIPs    map[string]bool
-	localMACs map[string]string
+	vpnIPs        map[string]bool
+	localMACs     map[string]string
+	localHostname string
 
 	groupByDevice bool
 }
@@ -240,6 +241,12 @@ func NewFlowTable() *FlowTable {
 		vpnIPs:    make(map[string]bool),
 		localMACs: make(map[string]string),
 	}
+}
+
+func (ft *FlowTable) SetLocalHostname(h string) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.localHostname = h
 }
 
 func (ft *FlowTable) SetGroupByDevice(v bool) {
@@ -1391,9 +1398,13 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 			d.FirstSeen = f.FirstSeen
 		}
 
-		// Hostname — из DNS или PTR
-		if d.Hostname == "" && f.Hostname != "" {
-			d.Hostname = f.Hostname
+		// Hostname: сначала localHostname (для своего ПК), потом PTR
+		if d.Hostname == "" {
+			if _, isLocal := ft.localMACs[d.IP]; isLocal && ft.localHostname != "" {
+				d.Hostname = ft.localHostname
+			} else if f.Hostname != "" {
+				d.Hostname = f.Hostname
+			}
 		}
 
 		// Домен

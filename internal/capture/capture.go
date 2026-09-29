@@ -91,6 +91,8 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	flowTable := NewFlowTable()
 	flowTable.anomaly = anomalyDetector
 	flowTable.dnsMapping = dnsMapping
+	hostname, _ := os.Hostname()
+	flowTable.SetLocalHostname(hostname)
 	flowTable.SetLocalMACs(localMACs)
 
 	return &Capture{
