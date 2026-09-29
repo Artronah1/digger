@@ -1172,3 +1172,138 @@ func ClassifyFlow(f *FlowStats, mapping *DNSMapping) Classification {
 	// 4. Не смогли определить
 	return ClassUnknown
 }
+
+// DeviceInfo — информация об устройстве LAN.
+type DeviceInfo struct {
+	IP        string
+	MAC       string
+	Vendor    string
+	Hostname  string
+	FirstSeen time.Time
+	LastSeen  time.Time
+
+	Conns     int
+	Domains   int
+	Protocols map[string]bool
+
+	BytesOut uint64
+	BytesIn  uint64
+}
+
+// BuildDevices собирает устройства LAN из flows.
+// Устройство — это LAN-клиент, не роутер.
+func (ft *FlowTable) BuildDevices() []DeviceInfo {
+	flows := ft.Snapshot()
+
+	devices := make(map[string]*DeviceInfo)
+	domainsByIP := make(map[string]map[string]bool)
+	protocolsByIP := make(map[string]map[string]bool)
+
+	for i := range flows {
+		f := &flows[i]
+
+		// Только LAN-клиенты
+		if !isLANIP(f.Key.LocalIP) {
+			continue
+		}
+		// Пропускаем трафик к LAN
+		if isLANIP(f.Key.RemoteIP) {
+			continue
+		}
+
+		ip := f.Key.LocalIP
+		d, ok := devices[ip]
+		if !ok {
+			mac := ft.arpTable[ip]
+			vendor := "unknown"
+			if mac != "" {
+				vendor = proc.DescribeMAC(mac)
+			}
+			d = &DeviceInfo{
+				IP:        ip,
+				MAC:       mac,
+				Vendor:    vendor,
+				FirstSeen: f.FirstSeen,
+			}
+			devices[ip] = d
+			domainsByIP[ip] = make(map[string]bool)
+			protocolsByIP[ip] = make(map[string]bool)
+		}
+
+		d.Conns++
+		d.BytesOut += f.BytesOut
+		d.BytesIn += f.BytesIn
+
+		if f.LastSeen.After(d.LastSeen) {
+			d.LastSeen = f.LastSeen
+		}
+		if f.FirstSeen.Before(d.FirstSeen) {
+			d.FirstSeen = f.FirstSeen
+		}
+
+		// Hostname — из DNS или PTR
+		if d.Hostname == "" && f.Hostname != "" {
+			d.Hostname = f.Hostname
+		}
+
+		// Домен
+		label := f.SNI
+		if label == "" {
+			label = f.Hostname
+		}
+		if label != "" {
+			domainsByIP[ip][label] = true
+		}
+
+		// Протокол
+		protocolsByIP[ip][f.Key.Proto] = true
+	}
+
+	out := make([]DeviceInfo, 0, len(devices))
+	for ip, d := range devices {
+		d.Domains = len(domainsByIP[ip])
+		d.Protocols = protocolsByIP[ip]
+		out = append(out, *d)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
+	return out
+}
+
+// PrintDevices выводит таблицу устройств LAN.
+func (ft *FlowTable) PrintDevices() {
+	devices := ft.BuildDevices()
+	if len(devices) == 0 {
+		return
+	}
+
+	fmt.Printf("\n=== Устройства LAN (%d) ===\n", len(devices))
+	fmt.Printf("%-16s %-18s %-16s %-14s %6s %8s %10s %10s %6s\n",
+		"IP", "MAC", "VENDOR", "HOSTNAME", "CONNS", "DOMAINS", "OUT", "IN", "AGE")
+
+	for _, d := range devices {
+		mac := d.MAC
+		if mac == "" {
+			mac = "—"
+		}
+		hostname := d.Hostname
+		if hostname == "" {
+			hostname = "—"
+		}
+		age := time.Since(d.FirstSeen).Truncate(time.Second)
+
+		fmt.Printf("%-16s %-18s %-16s %-14s %6d %8d %10s %10s %6s\n",
+			truncate(d.IP, 16),
+			truncate(mac, 18),
+			truncate(d.Vendor, 16),
+			truncate(hostname, 14),
+			d.Conns,
+			d.Domains,
+			humanBytes(d.BytesOut),
+			humanBytes(d.BytesIn),
+			age.String())
+	}
+	fmt.Println()
+}

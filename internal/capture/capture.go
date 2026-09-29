@@ -512,6 +512,11 @@ func (c *Capture) printAll() {
 	c.flows.PrintProfile(c.profileSNI)
 	c.checkDirectOutbound()
 	c.printPolicyViolations()
+	// LAN inventory (только в router-mode)
+	if c.routerMode {
+		c.flows.PrintDevices()
+	}
+
 	c.printHealth()
 
 	if c.anomaly != nil {

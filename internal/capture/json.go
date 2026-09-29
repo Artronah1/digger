@@ -152,6 +152,48 @@ func (c *Capture) printSnapshotJSON() {
 	printJSON(ev)
 }
 
+// DeviceEvent — событие об устройстве LAN.
+type DeviceEvent struct {
+	Event
+	Cycle     int    `json:"cycle"`
+	IP        string `json:"ip"`
+	MAC       string `json:"mac,omitempty"`
+	Vendor    string `json:"vendor,omitempty"`
+	Hostname  string `json:"hostname,omitempty"`
+	Conns     int    `json:"conns"`
+	Domains   int    `json:"domains"`
+	BytesOut  uint64 `json:"bytes_out"`
+	BytesIn   uint64 `json:"bytes_in"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+}
+
+// printDevicesJSON печатает устройства LAN.
+func (c *Capture) printDevicesJSON() {
+	if !c.routerMode {
+		return
+	}
+
+	devices := c.flows.BuildDevices()
+	for _, d := range devices {
+		ev := DeviceEvent{
+			Event:     newEvent("device"),
+			Cycle:     c.printCycle,
+			IP:        d.IP,
+			MAC:       d.MAC,
+			Vendor:    d.Vendor,
+			Hostname:  d.Hostname,
+			Conns:     d.Conns,
+			Domains:   d.Domains,
+			BytesOut:  d.BytesOut,
+			BytesIn:   d.BytesIn,
+			FirstSeen: d.FirstSeen.UTC().Format(time.RFC3339Nano),
+			LastSeen:  d.LastSeen.UTC().Format(time.RFC3339Nano),
+		}
+		printJSON(ev)
+	}
+}
+
 // printHealthJSON печатает Capture Health.
 func (c *Capture) printHealthJSON() {
 	c.stats.mu.Lock()
@@ -194,7 +236,7 @@ func (c *Capture) printAllJSON() {
 	c.printProxyProcessesJSON()
 	c.printAnomaliesJSON()
 	c.printDNSObservationsJSON()
-	// Policy
+	c.printDevicesJSON()
 	c.checkDirectOutbound()
 	c.printPolicyViolationsJSON()
 }
