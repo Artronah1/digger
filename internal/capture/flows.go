@@ -54,6 +54,45 @@ func reconPriority(r ReconstructionStatus) int {
 	}
 }
 
+// classPriority — приоритет классификации для агрегата.
+func classPriority(c Classification) int {
+	switch c {
+	case ClassVPN:
+		return 4
+	case ClassProxy:
+		return 3
+	case ClassDirect:
+		return 2
+	case ClassUnknown:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Classification — итоговая классификация потока.
+type Classification int
+
+const (
+	ClassUnknown Classification = iota
+	ClassDirect
+	ClassProxy
+	ClassVPN
+)
+
+func (c Classification) String() string {
+	switch c {
+	case ClassDirect:
+		return "direct"
+	case ClassProxy:
+		return "proxy"
+	case ClassVPN:
+		return "vpn"
+	default:
+		return "unknown"
+	}
+}
+
 type FlowKey struct {
 	LocalIP    string
 	LocalPort  uint16
@@ -116,7 +155,8 @@ type FlowStats struct {
 	VPNPort  uint16
 	VPNConf  string // "high" / "medium" / "low"
 	VPNSent  bool   // чтобы не дёргать детектор повторно
-
+	// Итоговая классификация
+	Class Classification
 	// Timeline: счётчики пакетов по секундам (последние 60 сек)
 	// Используем массив из 60 слотов, индекс = секунда эпохи % 60
 	Timeline    [60]uint64
@@ -159,19 +199,23 @@ type AggregatedFlow struct {
 	MSSKnown bool
 
 	Recon ReconstructionStatus
+	Class Classification
 }
 
 type FlowTable struct {
-	mu       sync.Mutex
-	flows    map[FlowKey]*FlowStats
-	resolver *dns.Resolver
-	arpTable map[string]string
-	anomaly  *AnomalyDetector
+	mu         sync.Mutex
+	flows      map[FlowKey]*FlowStats
+	resolver   *dns.Resolver
+	arpTable   map[string]string
+	anomaly    *AnomalyDetector
+	dnsMapping *DNSMapping
 
 	minPkts    int
 	hideIdle   bool
 	activeOnly int
 	appFilter  string
+
+	vpnIPs map[string]bool
 }
 
 func NewFlowTable() *FlowTable {
@@ -181,6 +225,7 @@ func NewFlowTable() *FlowTable {
 		arpTable: make(map[string]string),
 		minPkts:  0,
 		hideIdle: false,
+		vpnIPs:   make(map[string]bool),
 	}
 }
 
@@ -209,6 +254,12 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 			Key:       key,
 			FirstSeen: now,
 			seenSeq:   make(map[uint32]struct{}),
+			Recon:     ReconUnknown,
+			Class:     ClassUnknown,
+		}
+		// Если remote IP — известная VPN-нода, сразу VPN
+		if ft.vpnIPs[key.RemoteIP] {
+			f.Class = ClassVPN
 		}
 		ft.flows[key] = f
 	}
@@ -377,6 +428,7 @@ func (ft *FlowTable) Enrich() {
 	ft.arpTable = arp
 
 	for _, f := range ft.flows {
+		// Привязка процесса
 		if f.Comm == "" {
 			tupleKey := proc.SocketKey{
 				LocalIP:    f.Key.LocalIP,
@@ -396,8 +448,27 @@ func (ft *FlowTable) Enrich() {
 			}
 		}
 
+		// Hostname
 		if f.Hostname == "" {
 			f.Hostname = ft.resolver.Lookup(f.Key.RemoteIP)
+		}
+
+		// Классификация: если процесс-прокси и SNI не резолвится — VPN-нода
+		if f.Class == ClassUnknown && f.Comm != "" &&
+			looksLikeProxyProcess(f.Comm) && f.SNI != "" {
+			res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, ft.dnsMapping)
+			if res.Reason == "not-resolved" {
+				f.Class = ClassVPN
+				if ft.vpnIPs == nil {
+					ft.vpnIPs = make(map[string]bool)
+				}
+				ft.vpnIPs[f.Key.RemoteIP] = true
+			}
+		}
+
+		// Если IP уже помечен как VPN-нода — ставим ClassVPN
+		if f.Class == ClassUnknown && ft.vpnIPs[f.Key.RemoteIP] {
+			f.Class = ClassVPN
 		}
 	}
 }
@@ -486,6 +557,10 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		// Агрегируем Recon: если хотя бы один поток complete — значит SNI есть
 		if g.Recon == ReconUnknown || reconPriority(f.Recon) > reconPriority(g.Recon) {
 			g.Recon = f.Recon
+		}
+		// Классификация: VPN > PROXY > DIRECT > UNKNOWN
+		if classPriority(f.Class) > classPriority(g.Class) {
+			g.Class = f.Class
 		}
 		g.Gaps += f.Gaps
 
@@ -606,8 +681,8 @@ func (ft *FlowTable) Print() {
 	}
 	fmt.Printf(") ===\n")
 
-	fmt.Printf("%-28s %-32s %-7s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
-		"PROCESS", "SNI / REMOTE", "RECON", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
+	fmt.Printf("%-28s %-32s %-7s %-8s %-5s %5s %8s %8s %10s %10s %4s %4s %5s\n",
+		"PROCESS", "SNI / REMOTE", "RECON", "CLASS", "PROTO", "CONNS", "PKT/S", "AVG_SZ", "OUT", "IN", "RETR", "GAPS", "AGE")
 
 	for _, g := range groups {
 		age := time.Since(g.FirstSeen)
@@ -642,10 +717,12 @@ func (ft *FlowTable) Print() {
 			}
 		}
 
-		fmt.Printf("%-28s %-32s %-7s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
+		classStr := g.Class.String()
+		fmt.Printf("%-28s %-32s %-7s %-8s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
 			truncate(process, 28),
 			label,
 			reconStr,
+			classStr,
 			g.Proto,
 			g.Connections,
 			pktPerSec,
@@ -997,5 +1074,49 @@ func (ft *FlowTable) MarkVPN(srcIP string, srcPort uint16, dstIP string, dstPort
 		f.VPNProto = det.Proto
 		f.VPNPort = det.Port
 		f.VPNConf = det.Confidence
+		f.Class = ClassVPN
 	}
+
+	// Запоминаем IP VPN-ноды — все будущие потоки к нему будут VPN
+	if ft.vpnIPs == nil {
+		ft.vpnIPs = make(map[string]bool)
+	}
+	ft.vpnIPs[dstIP] = true
+}
+
+// ClassifyFlow определяет итоговую классификацию потока.
+// mapping используется для проверки SNI ↔ DNS. Может быть nil.
+func ClassifyFlow(f *FlowStats, mapping *DNSMapping) Classification {
+	// 1. VPN — если детектор сработал
+	if f.VPNProto != "" {
+		return ClassVPN
+	}
+
+	// 2. Прокси-процесс + нет SNI — прокси
+	if looksLikeProxyProcess(f.Comm) && f.SNI == "" {
+		return ClassProxy
+	}
+
+	// 3. SNI есть — проверяем через resolveSNIAt
+	if f.SNI != "" {
+		res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, mapping)
+		switch res.Reason {
+		case "matched":
+			return ClassDirect
+		case "not-resolved":
+			// Домен не резолвится — прокси-фронт
+			return ClassProxy
+		case "different-ip":
+			// Резолвится в другой IP — CDN-балансировка, не прокси
+			return ClassDirect
+		case "no-observation":
+			if len(res.ObservedIPs) > 0 {
+				// Резолвится — CDN, не прокси
+				return ClassDirect
+			}
+		}
+	}
+
+	// 4. Не смогли определить
+	return ClassUnknown
 }

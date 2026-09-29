@@ -66,9 +66,12 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		}
 	}
 
+	dnsMapping := NewDNSMapping()
+
 	anomalyDetector := NewAnomalyDetector()
 	flowTable := NewFlowTable()
 	flowTable.anomaly = anomalyDetector
+	flowTable.dnsMapping = dnsMapping
 
 	return &Capture{
 		handle:     handle,
@@ -76,7 +79,7 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 		stopCh:     make(chan struct{}),
 		flows:      flowTable,
 		dnsTable:   NewDNSTable(),
-		dnsMapping: NewDNSMapping(),
+		dnsMapping: dnsMapping,
 		anomaly:    anomalyDetector,
 		localIPs:   localIPs,
 		iface:      iface,
