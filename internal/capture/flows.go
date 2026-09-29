@@ -224,17 +224,19 @@ type FlowTable struct {
 	activeOnly int
 	appFilter  string
 
-	vpnIPs map[string]bool
+	vpnIPs    map[string]bool
+	localMACs map[string]string
 }
 
 func NewFlowTable() *FlowTable {
 	return &FlowTable{
-		flows:    make(map[FlowKey]*FlowStats),
-		resolver: dns.NewResolver(),
-		arpTable: make(map[string]string),
-		minPkts:  0,
-		hideIdle: false,
-		vpnIPs:   make(map[string]bool),
+		flows:     make(map[FlowKey]*FlowStats),
+		resolver:  dns.NewResolver(),
+		arpTable:  make(map[string]string),
+		minPkts:   0,
+		hideIdle:  false,
+		vpnIPs:    make(map[string]bool),
+		localMACs: make(map[string]string),
 	}
 }
 
@@ -434,6 +436,13 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 	}
 
 	return ""
+}
+
+// SetLocalMACs устанавливает MAC-адреса локальных интерфейсов (IP → MAC).
+func (ft *FlowTable) SetLocalMACs(macs map[string]string) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.localMACs = macs
 }
 
 func (ft *FlowTable) Enrich() {
@@ -1214,7 +1223,11 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 		ip := f.Key.LocalIP
 		d, ok := devices[ip]
 		if !ok {
+			// MAC: сначала arpTable, потом localMACs
 			mac := ft.arpTable[ip]
+			if mac == "" {
+				mac = ft.localMACs[ip]
+			}
 			vendor := "unknown"
 			if mac != "" {
 				vendor = proc.DescribeMAC(mac)

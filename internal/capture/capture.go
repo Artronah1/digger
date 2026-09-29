@@ -67,11 +67,19 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	}
 
 	localIPs := make(map[string]bool)
+	localMACs := make(map[string]string)
+
 	if ifi, err := net.InterfaceByName(iface); err == nil {
+		mac := ifi.HardwareAddr.String()
+
 		if addrs, err := ifi.Addrs(); err == nil {
 			for _, a := range addrs {
 				if ipn, ok := a.(*net.IPNet); ok {
-					localIPs[ipn.IP.String()] = true
+					ip := ipn.IP.String()
+					localIPs[ip] = true
+					if mac != "" {
+						localMACs[ip] = mac
+					}
 				}
 			}
 		}
@@ -83,6 +91,7 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	flowTable := NewFlowTable()
 	flowTable.anomaly = anomalyDetector
 	flowTable.dnsMapping = dnsMapping
+	flowTable.SetLocalMACs(localMACs)
 
 	return &Capture{
 		handle:     handle,
