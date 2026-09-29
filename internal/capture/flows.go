@@ -480,6 +480,10 @@ func (ft *FlowTable) Enrich() {
 		if f.Class == ClassUnknown && ft.vpnIPs[f.Key.RemoteIP] {
 			f.Class = ClassVPN
 		}
+		// Если поток ещё не классифицирован — классифицируем
+		if f.Class == ClassUnknown {
+			f.Class = ClassifyFlow(f, ft.dnsMapping)
+		}
 	}
 }
 

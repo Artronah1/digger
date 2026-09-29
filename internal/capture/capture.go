@@ -278,7 +278,7 @@ func (c *Capture) processData(data []byte) {
 	c.flows.Update(srcIP, srcPort, dstIP, dstPort, proto, len(data), isOutbound, tf, seq)
 
 	// SNI: аккумулируем payload и пытаемся извлечь (работает с фрагментацией)
-	if isOutbound && proto == "TCP" && dstPort == 443 && len(payload) > 0 {
+	if proto == "TCP" && dstPort == 443 && len(payload) > 0 {
 		key := FlowKey{
 			LocalIP:    srcIP,
 			LocalPort:  srcPort,
