@@ -12,7 +12,14 @@ import (
 )
 
 // schemaVersion — версия схемы JSON. При breaking changes — увеличивать.
-const schemaVersion = 1
+//
+// История:
+//
+//	1 — исходная схема (v0.3.0–v0.6.0)
+//	2 — v0.7.0: attribution.status коды вместо глифов,
+//	    FlowEvent без RemoteIP/RemotePort,
+//	    ProxySuspicion.ReasonCode, cycle в событиях
+const schemaVersion = 2
 
 func diggerVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {

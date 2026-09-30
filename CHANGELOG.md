@@ -1,3 +1,42 @@
+## [0.7.0] — 2026-09-30
+
+### Исправлено
+
+- **Паника на старте**: `NewAnomalyDetector` не инициализировал `knownDomains` / `baselineDomains` (nil map).
+- **Утечка горутин** в `Run()` и двойной вызов `Run()` в `main.go` (приводил к `panic` на `close(done)`).
+- **Sweep по TTL** для `AnomalyDetector`, `DNSTable`, `DNSMapping`, `FlowTable` — устранён рост памяти.
+- **Гонки** в `Aggregate` / `AggregateByApp` / `BuildDevices` — чтение через `currentView()`.
+- **`BEACON` был мёртв** — `baselineDomains` сохраняет историю.
+- **UDP retransmits** — отключены (не применяются к UDP).
+- **`SetFlags`** — матчинг по полям (mDNS / TCP-53 работают).
+- **DNS-over-TCP** — 2-байтовый префикс длины снимается.
+- **JA3** — исключён GREASE. **JA4** — SHA-256, сортировка, spec-compliant.
+- **`extractSNI`** — паника при 34-байтном ClientHello.
+- **GeoIP без mmdb** — «неизвестно» ≠ «не-российский IP».
+- **`-read`** — диспетчеризация в `RunFromPCAP`, link type проверяется.
+- **WireGuard-сигнатура** — по MAC2 (не путает с Telegram / QUIC).
+- **`vpnIPs`** — не помечается для `low` confidence.
+- **`isLANIP`** — включает multicast (mDNS не считается `DNS-LEAK`).
+- **`quic_test.go`** — `pn & 0xff`.
+- **`regression_test.go`** — убран дубль `buildClientHello`.
+
+### Изменено
+
+- `DNSMapping.Update(payload, srcIP, dstIP, proto)`.
+- `parseDNSResponse(msg)` — слит с `parseDNSResponseTTL`.
+- `detectVPN(payload, proto, srcPort, dstPort)`.
+- `ProxySuspicion.ReasonCode` — машинные коды.
+- `attribution.status` — коды вместо глифов.
+- `FlowTable.Close()` — закрывает resolver.
+- Двухфазный `Enrich` (I/O вне лока).
+- `schemaVersion` — **поднят до 2** (изменение схемы JSON).
+
+### Известные проблемы
+
+- `proxy_suspicion` дублируется каждый `cycle` (5 сек). Для анализа — `jq -r '... | sort -u'`.
+- `-read` использует wall-clock, не timestamp пакета (AGE/timeline искажены).
+- Baseline невалиден после рефакторинга (JA3/JA4 изменились) — пересоздать.
+
 ## [0.6.0] — 2026-09-29
 
 ### Добавлено
