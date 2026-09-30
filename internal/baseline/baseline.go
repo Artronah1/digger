@@ -8,7 +8,7 @@ import (
 )
 
 // SchemaVersion — версия схемы baseline.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // Baseline — снимок нормального поведения.
 type Baseline struct {
