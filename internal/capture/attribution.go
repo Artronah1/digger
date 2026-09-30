@@ -2,11 +2,14 @@ package capture
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
 
-// Attribution — связка одного TCP-потока с DNS-именами.
+// --- Типы ---
+
+// Attribution — связка одного TCP-потока с DNS-именами: SNI ↔ DNS ↔ IP.
 type Attribution struct {
 	LocalIP    string
 	LocalPort  uint16
@@ -20,7 +23,10 @@ type Attribution struct {
 	Age        time.Duration
 }
 
-// ProxyReason возвращает причину, по которой поток похож на прокси.
+// ProxyReason возвращает причину, по которой связка похожа на прокси.
+// NOTE: в BuildProxySuspicions используется своя логика (resolveSNIAt),
+// и вывод по mismatch ей противоречит. Проверить, задействован ли метод
+// (JSON-вывод?) — иначе удалить.
 func (a *Attribution) ProxyReason() string {
 	if a.SNI != "" && len(a.DNSNames) == 0 {
 		return "SNI без DNS — reality/trojan/vless?"
@@ -39,25 +45,44 @@ type ProxySuspicion struct {
 	RemotePort uint16
 	SNI        string
 	Process    string
-	Reason     string
+	Reason     string // человекочитаемая причина
+	ReasonCode string // машинный код: sni-not-resolved | sni-no-observation | process
 	Age        time.Duration
 }
 
-// BuildAttributions строит таблицу связок для потоков с SNI или remote IP.
+// ProxyProcess — агрегат по процессу-прокси.
+type ProxyProcess struct {
+	Process   string
+	Conns     int
+	BytesOut  uint64
+	BytesIn   uint64
+	RemoteIPs int
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// --- Общие фильтры ---
+
+// isPublicTCPFlow: TCP-поток на публичный IP — кандидат на атрибуцию.
+func isPublicTCPFlow(f FlowStats) bool {
+	return f.Key.RemoteIP != "" &&
+		f.Key.Proto == protoTCP &&
+		!isPrivateIP(f.Key.RemoteIP)
+}
+
+// --- Builders ---
+
+// BuildAttributions строит таблицу связок для публичных TCP-потоков.
 func BuildAttributions(flows []FlowStats, mapping *DNSMapping) []Attribution {
-	var out []Attribution
+	out := make([]Attribution, 0, len(flows))
 	now := time.Now()
 
 	for _, f := range flows {
-		if f.Key.RemoteIP == "" {
+		if !isPublicTCPFlow(f) {
 			continue
 		}
-		if f.Key.Proto != "TCP" {
-			continue
-		}
-		if isPrivateIP(f.Key.RemoteIP) {
-			continue
-		}
+
+		dnsNames := mapping.NamesForIP(f.Key.RemoteIP)
 
 		a := Attribution{
 			LocalIP:    f.Key.LocalIP,
@@ -65,30 +90,22 @@ func BuildAttributions(flows []FlowStats, mapping *DNSMapping) []Attribution {
 			RemoteIP:   f.Key.RemoteIP,
 			RemotePort: f.Key.RemotePort,
 			SNI:        f.SNI,
+			DNSNames:   dnsNames,
 			FirstSeen:  f.FirstSeen,
 			Age:        now.Sub(f.FirstSeen),
 		}
 
-		a.DNSNames = mapping.NamesForIP(f.Key.RemoteIP)
-
-		if f.SNI != "" {
-			for _, name := range a.DNSNames {
-				if name == f.SNI {
-					a.Matched = true
-					break
-				}
-			}
-			if !a.Matched && len(a.DNSNames) > 0 {
-				a.Mismatch = true
-			}
+		// Сравниваем SNI с DNS-именами этого IP (если есть и то и другое).
+		if f.SNI != "" && len(dnsNames) > 0 {
+			a.Matched = slices.Contains(dnsNames, f.SNI)
+			a.Mismatch = !a.Matched
 		}
 
 		out = append(out, a)
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].FirstSeen.After(out[j].FirstSeen)
-	})
+	// Новые сверху.
+	sort.Slice(out, func(i, j int) bool { return out[i].FirstSeen.After(out[j].FirstSeen) })
 	return out
 }
 
@@ -98,45 +115,15 @@ func BuildProxySuspicions(flows []FlowStats, mapping *DNSMapping) []ProxySuspici
 	var out []ProxySuspicion
 
 	for _, f := range flows {
-		if f.Key.RemoteIP == "" || f.Key.Proto != "TCP" {
-			continue
-		}
-		if isPrivateIP(f.Key.RemoteIP) {
+		if !isPublicTCPFlow(f) {
 			continue
 		}
 
-		proc := f.Comm
-
-		var reason string
-
-		if f.SNI != "" {
-			res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, mapping)
-			if !res.Matches {
-				switch res.Reason {
-				case "not-resolved":
-					// Домен вообще не резолвится — сильный признак прокси-фронта
-					reason = "SNI не резолвится — прокси-фронт?"
-				case "no-observation":
-					// Наблюдений нет, но и резолва нет
-					reason = "SNI без DNS-наблюдения — возможно прокси?"
-				case "no-mapping":
-					// Маппинг пуст — не можем проверить
-					reason = ""
-				case "different-ip":
-					// Резолвится в другой IP — CDN-балансировка, не прокси
-					reason = ""
-				}
-			}
+		code, reason := sniProxyReason(f, mapping)
+		if code == "" {
+			code, reason = proxyProcessReason(f)
 		}
-
-		// Процесс — известный прокси-клиент, SNI нет, IP не российский.
-		if reason == "" && looksLikeProxyProcess(proc) && f.SNI == "" {
-			if !isLikelyRussianIP(f.Key.RemoteIP) {
-				reason = "процесс-прокси на не-российский IP"
-			}
-		}
-
-		if reason == "" {
+		if code == "" {
 			continue
 		}
 
@@ -146,17 +133,22 @@ func BuildProxySuspicions(flows []FlowStats, mapping *DNSMapping) []ProxySuspici
 			RemoteIP:   f.Key.RemoteIP,
 			RemotePort: f.Key.RemotePort,
 			SNI:        f.SNI,
-			Process:    proc,
+			Process:    f.Comm,
 			Reason:     reason,
+			ReasonCode: code,
 			Age:        now.Sub(f.FirstSeen),
 		})
 	}
 
-	// Дедуп
-	seen := make(map[string]bool)
+	// Новые сверху — стабильный порядок вывода между циклами печати.
+	sort.Slice(out, func(i, j int) bool { return out[i].Age < out[j].Age })
+
+	// Дедуп по (устройство, SNI, IP, процесс). Запись идёт поверх
+	// исходного слайса: индекс записи всегда <= индекса чтения.
+	seen := make(map[string]bool, len(out))
 	deduped := out[:0]
 	for _, s := range out {
-		key := s.SNI + "|" + s.RemoteIP + "|" + s.Process
+		key := s.LocalIP + "|" + s.SNI + "|" + s.RemoteIP + "|" + s.Process
 		if seen[key] {
 			continue
 		}
@@ -166,24 +158,124 @@ func BuildProxySuspicions(flows []FlowStats, mapping *DNSMapping) []ProxySuspici
 	return deduped
 }
 
+// sniProxyReason — причина «похоже на прокси» по SNI; ("", "") — не похоже.
+func sniProxyReason(f FlowStats, mapping *DNSMapping) (code, text string) {
+	if f.SNI == "" {
+		return "", ""
+	}
+
+	res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, mapping)
+	if res.Matches {
+		return "", ""
+	}
+	switch res.Reason {
+	case "not-resolved":
+		// Домен вообще не резолвится — сильный признак прокси-фронта.
+		return "sni-not-resolved", "SNI не резолвится — прокси-фронт?"
+	case "no-observation":
+		// Резолва нет и наблюдений нет.
+		return "sni-no-observation", "SNI без DNS-наблюдения — возможно прокси?"
+	default:
+		// "no-mapping" — нечем проверить;
+		// "different-ip" — CDN-балансировка, не прокси.
+		return "", ""
+	}
+}
+
+// proxyProcessReason — известный прокси-клиент без SNI на не-российский IP.
+func proxyProcessReason(f FlowStats) (code, text string) {
+	if f.SNI != "" || !looksLikeProxyProcess(f.Comm) {
+		return "", ""
+	}
+	switch geoipCountry(f.Key.RemoteIP) {
+	case "", "RU": // нет GeoIP-базы или Россия — не флажим
+		return "", ""
+	}
+	return "process", "процесс-прокси на не-российский IP"
+}
+
+// BuildProxyProcesses собирает агрегат по процессам-прокси:
+// все публичные потоки процессов, похожих на прокси-клиентов.
+func BuildProxyProcesses(flows []FlowStats) []ProxyProcess {
+	type agg struct {
+		conns     int
+		bytesOut  uint64
+		bytesIn   uint64
+		remoteIPs map[string]bool
+		firstSeen time.Time
+		lastSeen  time.Time
+	}
+
+	groups := make(map[string]*agg)
+
+	for _, f := range flows {
+		if f.Comm == "" || !looksLikeProxyProcess(f.Comm) {
+			continue
+		}
+		if isPrivateIP(f.Key.RemoteIP) {
+			continue
+		}
+
+		g, ok := groups[f.Comm]
+		if !ok {
+			g = &agg{remoteIPs: make(map[string]bool), firstSeen: f.FirstSeen}
+			groups[f.Comm] = g
+		}
+		g.conns++
+		g.bytesOut += f.BytesOut
+		g.bytesIn += f.BytesIn
+		g.remoteIPs[f.Key.RemoteIP] = true
+		if f.LastSeen.After(g.lastSeen) {
+			g.lastSeen = f.LastSeen
+		}
+		if f.FirstSeen.Before(g.firstSeen) {
+			g.firstSeen = f.FirstSeen
+		}
+	}
+
+	out := make([]ProxyProcess, 0, len(groups))
+	for name, g := range groups {
+		out = append(out, ProxyProcess{
+			Process:   name,
+			Conns:     g.conns,
+			BytesOut:  g.bytesOut,
+			BytesIn:   g.bytesIn,
+			RemoteIPs: len(g.remoteIPs),
+			FirstSeen: g.firstSeen,
+			LastSeen:  g.lastSeen,
+		})
+	}
+
+	// Недавно активные сверху.
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
+	return out
+}
+
+// --- Вывод ---
+
 // printAttribution выводит таблицу связок DNS ↔ SNI ↔ IP.
+//
+// Статусы: ✓ SNI совпал с DNS · ⚠ SNI ≠ DNS · ~ DNS есть, SNI нет ·
+// ✗ SNI есть, DNS нет · ? ни того, ни другого.
 func printAttribution(flows []FlowStats, mapping *DNSMapping) {
 	attrs := BuildAttributions(flows, mapping)
 	if len(attrs) == 0 {
 		return
 	}
 
-	matched := 0
-	mismatched := 0
-	unresolved := 0
+	var matched, mismatched, sniNoDNS, plain int
 	for _, a := range attrs {
 		switch {
 		case a.Matched:
 			matched++
 		case a.Mismatch:
 			mismatched++
-		case len(a.DNSNames) == 0 && a.SNI == "":
-			unresolved++
+		case len(a.DNSNames) > 0:
+			// "~": атрибуция по DNS, SNI нет.
+		case a.SNI != "":
+			sniNoDNS++ // ✗ — SNI без DNS, классический признак прокси
+		default:
+			plain++ // "?"
 		}
 	}
 
@@ -191,8 +283,8 @@ func printAttribution(flows []FlowStats, mapping *DNSMapping) {
 	if mismatched > 0 {
 		fmt.Printf("⚠  несовпадений SNI ↔ DNS: %d\n", mismatched)
 	}
-	fmt.Printf("✓ совпало: %d   ⚠ не совпало: %d   ? без DNS: %d\n\n",
-		matched, mismatched, unresolved)
+	fmt.Printf("✓ совпало: %d   ⚠ не совпало: %d   ✗ SNI без DNS: %d   ? без атрибуции: %d\n\n",
+		matched, mismatched, sniNoDNS, plain)
 
 	fmt.Printf("%-22s %-16s %-32s %-32s %-6s %s\n",
 		"LOCAL", "REMOTE IP", "SNI", "DNS (names для этого IP)", "STATUS", "AGE")
@@ -213,19 +305,20 @@ func printAttribution(flows []FlowStats, mapping *DNSMapping) {
 		}
 
 		status := "?"
-		if a.Matched {
+		switch {
+		case a.Matched:
 			status = "✓"
-		} else if a.Mismatch {
+		case a.Mismatch:
 			status = "⚠"
-		} else if len(a.DNSNames) > 0 {
+		case len(a.DNSNames) > 0:
 			status = "~"
-		} else if a.SNI != "" {
+		case a.SNI != "":
 			status = "✗"
 		}
 
 		fmt.Printf("%-22s %-16s %-32s %-32s %-6s %s\n",
 			truncate(local, 22),
-			a.RemoteIP,
+			truncate(a.RemoteIP, 16),
 			truncate(sni, 32),
 			truncate(dnsNames, 32),
 			status,
@@ -234,14 +327,14 @@ func printAttribution(flows []FlowStats, mapping *DNSMapping) {
 	fmt.Println()
 }
 
-// printProxySuspicions выводит потоки, похожие на прокси/VPN-клиент.
+// printProxySuspicions выводит потоки, похожие на прокси/VPN-клиент,
+// и регистрирует их в детекторе аномалий (дедуп внутри RecordProxy).
 func printProxySuspicions(flows []FlowStats, mapping *DNSMapping, anomaly *AnomalyDetector) {
 	sus := BuildProxySuspicions(flows, mapping)
 	if len(sus) == 0 {
 		return
 	}
 
-	// Регистрируем в детекторе аномалий
 	if anomaly != nil {
 		for _, s := range sus {
 			anomaly.RecordProxy(s.SNI, s.RemoteIP, s.Process, s.Reason)
@@ -273,80 +366,6 @@ func printProxySuspicions(flows []FlowStats, mapping *DNSMapping, anomaly *Anoma
 			s.Reason)
 	}
 	fmt.Println()
-}
-
-// ProxyProcess — агрегат по процессу-прокси.
-type ProxyProcess struct {
-	Process   string
-	Conns     int
-	BytesOut  uint64
-	BytesIn   uint64
-	RemoteIPs int
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// BuildProxyProcesses собирает агрегат по процессам-прокси.
-func BuildProxyProcesses(flows []FlowStats) []ProxyProcess {
-	type agg struct {
-		conns     int
-		bytesOut  uint64
-		bytesIn   uint64
-		remoteIPs map[string]bool
-		firstSeen time.Time
-		lastSeen  time.Time
-	}
-
-	groups := make(map[string]*agg)
-
-	for _, f := range flows {
-		if f.Comm == "" {
-			continue
-		}
-		if !looksLikeProxyProcess(f.Comm) {
-			continue
-		}
-		if isPrivateIP(f.Key.RemoteIP) {
-			continue
-		}
-
-		g, ok := groups[f.Comm]
-		if !ok {
-			g = &agg{
-				remoteIPs: make(map[string]bool),
-				firstSeen: f.FirstSeen,
-			}
-			groups[f.Comm] = g
-		}
-		g.conns++
-		g.bytesOut += f.BytesOut
-		g.bytesIn += f.BytesIn
-		g.remoteIPs[f.Key.RemoteIP] = true
-		if f.LastSeen.After(g.lastSeen) {
-			g.lastSeen = f.LastSeen
-		}
-		if f.FirstSeen.Before(g.firstSeen) {
-			g.firstSeen = f.FirstSeen
-		}
-	}
-
-	out := make([]ProxyProcess, 0, len(groups))
-	for name, g := range groups {
-		out = append(out, ProxyProcess{
-			Process:   name,
-			Conns:     g.conns,
-			BytesOut:  g.bytesOut,
-			BytesIn:   g.bytesIn,
-			RemoteIPs: len(g.remoteIPs),
-			FirstSeen: g.firstSeen,
-			LastSeen:  g.lastSeen,
-		})
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeen.After(out[j].LastSeen)
-	})
-	return out
 }
 
 // printProxyProcesses выводит таблицу процессов-прокси.

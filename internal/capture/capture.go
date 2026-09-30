@@ -4,48 +4,86 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"time"
 
 	"digger/internal/baseline"
 	"digger/internal/policy"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/huatuo-ai/go-pcap"
 )
 
+// --- Константы (были магическими числами) ---
+
+const (
+	portDNS   uint16 = 53   // DNS
+	portMDNS  uint16 = 5353 // mDNS
+	portHTTPS uint16 = 443  // TLS / QUIC
+
+	protoTCP = "TCP"
+	protoUDP = "UDP"
+
+	printInterval  = 5 * time.Second // период вывода
+	enrichInterval = 1 * time.Second // период enrichment
+
+	anomalyWindow   = 5 * time.Minute // окно аномалий
+	shortDebugLimit = 5               // сколько коротких пакетов показывать в verbose
+
+	ethHeaderLen = 14 // минимальный Ethernet-кадр
+)
+
+// Capture — сессия захвата и анализа трафика.
 type Capture struct {
-	handle     *pcap.Handle
-	verbose    bool
-	stopCh     chan struct{}
-	stopOnce   sync.Once
+	// --- Захват ---
+	handle  *pcap.Handle
+	iface   string
+	filter  string
+	snaplen int
+	verbose bool
+
+	// --- Жизненный цикл ---
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
+	// --- Состояние анализа ---
 	flows      *FlowTable
 	dnsTable   *DNSTable
 	dnsMapping *DNSMapping
 	anomaly    *AnomalyDetector
+
+	// --- Контекст устройства ---
 	localIPs   map[string]bool
-	profileSNI string
 	routerMode bool
+
+	// --- Отображение ---
+	profileSNI string
 	groupBy    string // "app" | "device" | ""
-	appFilter  string // фильтр по имени приложения
-	iface      string
-	filter     string
-	snaplen    int
-	stats      CaptureStats
+	appFilter  string
 	outputMode string // "text" | "json"
-	printCycle int
 	showPTR    bool
 	quiet      bool
 	dnsAge     time.Duration
-	// PCAP-режим
-	pcapReader   *pcapgo.Reader
-	pcapFile     *os.File
-	policy       *policy.Policy
-	violations   []policy.Violation
-	violationsMu sync.Mutex
-	baselineRef  *baseline.Baseline
+
+	// --- PCAP-режим (чтение из файла) ---
+	pcapReader *pcapgo.Reader
+	pcapFile   *os.File
+
+	// --- Policy / baseline ---
+	policy            *policy.Policy
+	baselineRef       *baseline.Baseline
+	violations        []policy.Violation
+	violationSeen     map[string]bool // дедуп по (rule, actual)
+	violationsEmitted map[string]bool // какие нарушения уже ушли в JSON
+	violationsMu      sync.Mutex
+
+	stats CaptureStats
+
+	printCycle int // номер цикла вывода; инкрементируется в printAll
 }
 
 type CaptureStats struct {
@@ -56,6 +94,7 @@ type CaptureStats struct {
 	PacketsTruncated uint64
 	DecodeErrors     uint64
 	NoIPLayer        uint64
+	ShortPackets     uint64
 
 	BytesReceived  uint64
 	BytesProcessed uint64
@@ -63,34 +102,70 @@ type CaptureStats struct {
 	StartedAt time.Time
 }
 
+// statsSnapshot — копия статистики, безопасная для печати без мьютекса.
+type statsSnapshot struct {
+	PacketsReceived, PacketsProcessed, PacketsTruncated uint64
+	DecodeErrors, NoIPLayer, ShortPackets               uint64
+	BytesReceived, BytesProcessed                       uint64
+	StartedAt                                           time.Time
+}
+
+func (c *Capture) statsSnapshot() statsSnapshot {
+	c.stats.mu.Lock()
+	defer c.stats.mu.Unlock()
+	return statsSnapshot{
+		PacketsReceived:  c.stats.PacketsReceived,
+		PacketsProcessed: c.stats.PacketsProcessed,
+		PacketsTruncated: c.stats.PacketsTruncated,
+		DecodeErrors:     c.stats.DecodeErrors,
+		NoIPLayer:        c.stats.NoIPLayer,
+		ShortPackets:     c.stats.ShortPackets,
+		BytesReceived:    c.stats.BytesReceived,
+		BytesProcessed:   c.stats.BytesProcessed,
+		StartedAt:        c.stats.StartedAt,
+	}
+}
+
+// localAddresses возвращает IP-адреса интерфейса и маппинг IP→MAC.
+func localAddresses(iface string) (map[string]bool, map[string]string) {
+	ips := make(map[string]bool)
+	macs := make(map[string]string)
+
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return ips, macs // интерфейс без адресов — не ошибка
+	}
+	mac := ifi.HardwareAddr.String()
+
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return ips, macs
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipn.IP.String()
+		ips[ip] = true
+		if mac != "" {
+			macs[ip] = mac
+		}
+	}
+	return ips, macs
+}
+
 func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	handle, err := pcap.OpenLive(iface, int32(snaplen), true, 0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open interface %s: %w", iface, err)
 	}
 
-	localIPs := make(map[string]bool)
-	localMACs := make(map[string]string)
-
-	if ifi, err := net.InterfaceByName(iface); err == nil {
-		mac := ifi.HardwareAddr.String()
-
-		if addrs, err := ifi.Addrs(); err == nil {
-			for _, a := range addrs {
-				if ipn, ok := a.(*net.IPNet); ok {
-					ip := ipn.IP.String()
-					localIPs[ip] = true
-					if mac != "" {
-						localMACs[ip] = mac
-					}
-				}
-			}
-		}
-	}
-
-	dnsMapping := NewDNSMapping()
+	localIPs, localMACs := localAddresses(iface)
 
 	anomalyDetector := NewAnomalyDetector()
+	dnsMapping := NewDNSMapping()
+
 	flowTable := NewFlowTable()
 	flowTable.anomaly = anomalyDetector
 	flowTable.dnsMapping = dnsMapping
@@ -113,30 +188,43 @@ func New(iface string, snaplen int, verbose bool) (*Capture, error) {
 	}, nil
 }
 
+// --- Конфигурация (вызывать до Run) ---
+
 func (c *Capture) SetMinPkts(n int)                 { c.flows.SetMinPkts(n) }
 func (c *Capture) SetHideIdle(v bool)               { c.flows.SetHideIdle(v) }
 func (c *Capture) SetQuiet(v bool)                  { c.quiet = v }
 func (c *Capture) SetActiveOnly(n int)              { c.flows.SetActiveOnly(n) }
 func (c *Capture) SetProfile(sni string)            { c.profileSNI = sni }
 func (c *Capture) SetBaseline(b *baseline.Baseline) { c.baselineRef = b }
+func (c *Capture) SetPolicy(p *policy.Policy)       { c.policy = p }
+
 func (c *Capture) SetDNSAge(d time.Duration) {
 	c.dnsAge = d
 	c.dnsTable.SetMaxAge(d)
 }
+
 func (c *Capture) SetShowPTR(v bool) {
 	c.showPTR = v
 	c.dnsTable.SetShowPTR(v)
 }
+
 func (c *Capture) SetGroupBy(s string) {
 	c.groupBy = s
 	c.flows.SetGroupByDevice(s == "device")
 }
+
 func (c *Capture) SetAppFilter(s string) { c.appFilter = s; c.flows.SetAppFilter(s) }
 func (c *Capture) SetRouterMode(v bool)  { c.routerMode = v }
 
 func (c *Capture) SetFilter(expr string) error {
 	c.filter = expr
-	return c.handle.SetBPFFilter(expr)
+	if c.pcapReader != nil {
+		return fmt.Errorf("BPF-фильтр не поддерживается при чтении PCAP")
+	}
+	if err := c.handle.SetBPFFilter(expr); err != nil {
+		return fmt.Errorf("set BPF filter %q: %w", expr, err)
+	}
+	return nil
 }
 
 func (c *Capture) SetOutputMode(mode string) {
@@ -146,50 +234,537 @@ func (c *Capture) SetOutputMode(mode string) {
 	c.outputMode = mode
 }
 
-func (c *Capture) addViolation(v policy.Violation) {
-	c.violationsMu.Lock()
-	defer c.violationsMu.Unlock()
+// --- Жизненный цикл ---
 
-	// Дедуп: одинаковый (rule, actual) — один раз
-	for _, existing := range c.violations {
-		if existing.Rule == v.Rule && existing.Actual == v.Actual {
-			return
-		}
+// Close останавливает захват и освобождает ресурсы (handle, PCAP-файл).
+// Идемпотентен; вызывать после завершения Run (defer — после <-done).
+func (c *Capture) Close() {
+	c.Stop()
+	c.flows.Close()
+
+	if c.pcapFile != nil {
+		c.pcapFile.Close()
+		c.pcapFile = nil
 	}
-	c.violations = append(c.violations, v)
+	if c.handle != nil {
+		c.handle.Close()
+	}
 }
 
-func (c *Capture) checkDirectOutbound() {
-	if c.policy == nil {
+// Run запускает захват; блокируется до Stop() или закрытия канала пакетов.
+func (c *Capture) Run() {
+	if c.pcapReader != nil {
+		c.RunFromPCAP()
 		return
 	}
-	if len(c.policy.AllowDirect) == 0 {
+
+	packets := c.handle.Listen()
+
+	c.stats.mu.Lock()
+	c.stats.StartedAt = time.Now()
+	c.stats.mu.Unlock()
+
+	// Печать и enrich — в отдельных горутинах, основной цикл только читает пакеты.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); c.printLoop() }()
+	go func() { defer wg.Done(); c.enrichLoop() }()
+	defer wg.Wait()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case raw, ok := <-packets:
+			if !ok {
+				// Канал закрылся (захват умер) — завершаемся штатно:
+				// финальный вывод будет напечатан, горутины не утекут.
+				c.Stop()
+				return
+			}
+			c.processData(raw.B)
+		}
+	}
+}
+
+func (c *Capture) Stop() {
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
+}
+
+// --- Обработка пакетов ---
+
+// packetInfo — результат разбора одного Ethernet-кадра.
+type packetInfo struct {
+	srcIP, dstIP     string
+	srcPort, dstPort uint16
+	isIPv6           bool
+
+	proto    string // "TCP" | "UDP" | "OTHER"
+	payload  []byte
+	tcpFlags TCPFlags
+	seq      uint32
+}
+
+func (p *packetInfo) flowKey() FlowKey {
+	return FlowKey{
+		LocalIP: p.srcIP, LocalPort: p.srcPort,
+		RemoteIP: p.dstIP, RemotePort: p.dstPort,
+		Proto: p.proto,
+	}
+}
+
+func (p *packetInfo) reverseFlowKey() FlowKey {
+	return FlowKey{
+		LocalIP: p.dstIP, LocalPort: p.dstPort,
+		RemoteIP: p.srcIP, RemotePort: p.srcPort,
+		Proto: p.proto,
+	}
+}
+
+// isDNSPort: UDP/53, UDP/5353, TCP/53.
+func (p *packetInfo) isDNSPort() bool {
+	switch p.proto {
+	case protoUDP:
+		return p.srcPort == portDNS || p.dstPort == portDNS ||
+			p.srcPort == portMDNS || p.dstPort == portMDNS
+	case protoTCP:
+		return p.srcPort == portDNS || p.dstPort == portDNS
+	}
+	return false
+}
+
+func (p *packetInfo) isDNSQuery() bool {
+	switch p.proto {
+	case protoTCP:
+		return p.dstPort == portDNS
+	default:
+		return p.dstPort == portDNS || p.dstPort == portMDNS
+	}
+}
+
+func (p *packetInfo) isDNSResponse() bool {
+	switch p.proto {
+	case protoTCP:
+		return p.srcPort == portDNS
+	default:
+		return p.srcPort == portDNS || p.srcPort == portMDNS
+	}
+}
+
+func (c *Capture) processData(data []byte) {
+	if len(data) < ethHeaderLen {
+		c.noteShortPacket(data)
+		return
+	}
+
+	c.stats.mu.Lock()
+	c.stats.PacketsReceived++
+	c.stats.BytesReceived += uint64(len(data))
+	c.stats.mu.Unlock()
+
+	p, ok := c.decode(data)
+	if !ok {
+		return
+	}
+
+	c.stats.mu.Lock()
+	c.stats.PacketsProcessed++
+	c.stats.BytesProcessed += uint64(len(data))
+	c.stats.mu.Unlock()
+
+	isOutbound := c.directionOf(p.srcIP, p.dstIP)
+	c.flows.Update(p.srcIP, p.srcPort, p.dstIP, p.dstPort, p.proto, len(data), isOutbound, p.tcpFlags, p.seq)
+
+	c.checkPolicyIPv6(p)
+	c.handleTLSSNI(p)
+	c.handleDNS(p)
+	c.handleQUICSNI(p)
+	c.handleVPN(p, isOutbound)
+}
+
+// noteShortPacket учитывает (и в verbose показывает) кадры короче Ethernet-заголовка.
+func (c *Capture) noteShortPacket(data []byte) {
+	c.stats.mu.Lock()
+	c.stats.ShortPackets++
+	c.stats.PacketsReceived++
+	c.stats.BytesReceived += uint64(len(data))
+	n := c.stats.ShortPackets
+	c.stats.mu.Unlock()
+
+	if c.verbose && n <= shortDebugLimit {
+		fmt.Fprintf(os.Stderr, "[SHORT] len=%d data=%x\n", len(data), data)
+	}
+}
+
+// decode парсит Ethernet-кадр; false — пакет пропускается (статистика учтена).
+func (c *Capture) decode(data []byte) (*packetInfo, bool) {
+	gp := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
+
+	if gp.ErrorLayer() != nil {
+		c.stats.mu.Lock()
+		c.stats.DecodeErrors++
+		c.stats.mu.Unlock()
+		return nil, false
+	}
+
+	// gopacket.NewPacket не заполняет Metadata, так что прежняя проверка
+	// CaptureLength < Length никогда не срабатывала. Усечение ловим
+	// эвристикой: кадр ровно в snaplen байт мог быть обрезан.
+	if c.snaplen > 0 && len(data) >= c.snaplen {
+		c.stats.mu.Lock()
+		c.stats.PacketsTruncated++
+		c.stats.mu.Unlock()
+	}
+
+	ipLayer := gp.NetworkLayer()
+	if ipLayer == nil {
+		c.stats.mu.Lock()
+		c.stats.NoIPLayer++
+		c.stats.mu.Unlock()
+		return nil, false
+	}
+
+	p := &packetInfo{proto: "OTHER"}
+	switch ip := ipLayer.(type) {
+	case *layers.IPv4:
+		p.srcIP, p.dstIP = ip.SrcIP.String(), ip.DstIP.String()
+	case *layers.IPv6:
+		p.srcIP, p.dstIP = ip.SrcIP.String(), ip.DstIP.String()
+		p.isIPv6 = true
+	}
+
+	if tcp, ok := gp.Layer(layers.LayerTypeTCP).(*layers.TCP); ok {
+		p.proto, p.srcPort, p.dstPort = protoTCP, uint16(tcp.SrcPort), uint16(tcp.DstPort)
+		p.payload, p.seq = tcp.Payload, tcp.Seq
+		p.tcpFlags = tcpFlagsOf(tcp)
+	} else if udp, ok := gp.Layer(layers.LayerTypeUDP).(*layers.UDP); ok {
+		p.proto, p.srcPort, p.dstPort = protoUDP, uint16(udp.SrcPort), uint16(udp.DstPort)
+		p.payload = udp.Payload
+	}
+
+	return p, true
+}
+
+// directionOf решает, исходит ли пакет от "нас" (outbound).
+func (c *Capture) directionOf(srcIP, dstIP string) bool {
+	if !c.routerMode {
+		return c.localIPs[srcIP]
+	}
+	srcLAN, dstLAN := isLANIP(srcIP), isLANIP(dstIP)
+	switch {
+	case srcLAN && !dstLAN:
+		return true // LAN → Internet
+	case !srcLAN && dstLAN:
+		return false // Internet → LAN
+	case srcLAN && dstLAN:
+		return !c.localIPs[srcIP] // внутри LAN: чужое устройство → не наш трафик
+	default:
+		return false
+	}
+}
+
+// --- Прикладные обработчики ---
+
+// checkPolicyIPv6: IPv6 запрещён политикой.
+func (c *Capture) checkPolicyIPv6(p *packetInfo) {
+	if c.policy == nil || c.policy.IsIPv6Allowed() || !p.isIPv6 {
+		return
+	}
+	c.addViolation(policy.Violation{
+		Rule:     "ipv6",
+		Expected: "disabled",
+		Actual:   fmt.Sprintf("%s → %s", p.srcIP, p.dstIP),
+		Detail:   "IPv6-трафик при policy.ipv6=false",
+	})
+}
+
+// handleTLSSNI аккумулирует payload ClientHello (фрагментация допустима)
+// и извлекает SNI; затем помечает соединение в детекторе аномалий.
+func (c *Capture) handleTLSSNI(p *packetInfo) {
+	if p.proto != protoTCP || p.dstPort != portHTTPS || len(p.payload) == 0 {
+		return
+	}
+	sni := c.flows.AppendPayload(p.flowKey(), p.payload)
+	if sni != "" && c.anomaly != nil {
+		c.anomaly.MarkConnected(sni)
+	}
+}
+
+// handleDNS обрабатывает DNS/mDNS: таблицу ответов, аномалии запросов
+// и policy-проверку резолвера.
+// Внимание: для mDNS (оба порта 5353) запрос и ответ — не взаимоисключающие
+// ветки, поэтому отдельные if, а не switch.
+func (c *Capture) handleDNS(p *packetInfo) {
+	if len(p.payload) == 0 || !p.isDNSPort() {
+		return
+	}
+
+	c.dnsTable.Update(p.payload, p.srcIP, p.dstIP, p.srcPort, p.dstPort, p.proto)
+
+	if p.isDNSQuery() {
+		c.handleDNSQuery(p)
+	}
+	if p.isDNSResponse() {
+		c.dnsMapping.Update(p.payload, p.dstIP, p.srcIP, p.proto)
+	}
+}
+
+func (c *Capture) handleDNSQuery(p *packetInfo) {
+	msg := dnsMessage(p.payload, p.proto)
+	if msg == nil {
+		return
+	}
+	name, qtype, ok := parseDNSQuery(msg)
+	if !ok {
+		return
+	}
+
+	if c.anomaly != nil {
+		if leak := c.anomaly.CheckDNSLeak(p.dstIP, name); leak != "" {
+			c.dnsTable.SetFlags(name, qtype, p.srcIP, p.dstIP, leak)
+		}
+		if flag := c.anomaly.CheckDomain(name, true); flag != "" {
+			c.dnsTable.SetFlags(name, qtype, p.srcIP, p.dstIP, flag)
+		}
+		c.anomaly.RecordDNSOnly(name)
+	}
+
+	// Policy: разрешён ли резолвер. Не зависит от anomaly.
+	if c.policy != nil && !c.policy.IsResolverAllowed(p.dstIP) {
+		c.dnsTable.SetFlags(name, qtype, p.srcIP, p.dstIP,
+			fmt.Sprintf("⚠POLICY-DNS→%s", p.dstIP))
+	}
+}
+
+// handleQUICSNI извлекает SNI из QUIC Initial (UDP/443).
+func (c *Capture) handleQUICSNI(p *packetInfo) {
+	if p.proto != protoUDP || len(p.payload) == 0 ||
+		(p.srcPort != portHTTPS && p.dstPort != portHTTPS) {
+		return
+	}
+	sni := extractQUICSNI(p.payload, p.srcIP, p.dstIP, p.srcPort, p.dstPort)
+	if sni == "" {
+		return
+	}
+
+	// Локальная сторона — та, у которой не 443.
+	key := p.flowKey()
+	if p.srcPort == portHTTPS {
+		key = p.reverseFlowKey()
+	}
+	c.flows.SetSNI(key, sni)
+	if c.anomaly != nil {
+		c.anomaly.MarkConnected(sni)
+	}
+}
+
+// handleVPN детектит VPN-протоколы в payload исходящих пакетов.
+func (c *Capture) handleVPN(p *packetInfo, isOutbound bool) {
+	if !isOutbound || len(p.payload) == 0 || (p.proto != protoTCP && p.proto != protoUDP) {
+		return
+	}
+	if det := detectVPN(p.payload, p.proto, p.srcPort, p.dstPort); det != nil {
+		c.flows.MarkVPN(p.srcIP, p.srcPort, p.dstIP, p.dstPort, p.proto, det)
+	}
+}
+
+// --- Фоновые горутины ---
+
+func (c *Capture) printLoop() {
+	ticker := time.NewTicker(printInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			c.printAll() // финальный вывод
+			return
+		case <-ticker.C:
+			c.printAll()
+		}
+	}
+}
+
+func (c *Capture) enrichLoop() {
+	ticker := time.NewTicker(enrichInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			c.flows.Enrich()
+			return
+		case <-ticker.C:
+			c.flows.Enrich()
+		}
+	}
+}
+
+// --- Вывод ---
+
+func (c *Capture) printAll() {
+	if c.quiet {
+		return
+	}
+	c.printCycle++ // цикл инкрементируется ДО baseline-диффа: весь вывод одного прохода — один cycle
+	if c.baselineRef != nil {
+		c.printBaselineDiffJSON(c.baselineRef)
+	}
+	if c.outputMode == "json" {
+		c.printAllJSON()
+		return
+	}
+	c.printText()
+}
+
+func (c *Capture) printText() {
+	c.flows.Enrich()
+
+	if c.groupBy == "app" || c.groupBy == "device" {
+		c.flows.PrintApps()
+	} else {
+		c.flows.Print()
+	}
+	c.dnsTable.Print()
+
+	flows := c.flows.Snapshot()
+	printAttribution(flows, c.dnsMapping)
+	printProxySuspicions(flows, c.dnsMapping, c.anomaly)
+	printProxyProcesses(flows)
+
+	c.printAnomalies()
+	c.flows.PrintProfile(c.profileSNI)
+	c.checkDirectOutbound()
+	c.printPolicyViolations()
+
+	// LAN inventory (только в router-mode)
+	if c.routerMode {
+		c.flows.PrintDevices()
+	}
+
+	c.printHealth()
+
+	if c.anomaly != nil {
+		c.anomaly.SaveHistory()
+	}
+}
+
+func (c *Capture) printHealth() {
+	s := c.statsSnapshot()
+
+	uptime := time.Since(s.StartedAt).Truncate(time.Second)
+
+	quality := "✓ complete"
+	if s.PacketsTruncated > 0 || s.DecodeErrors > 0 {
+		quality = "⚠ incomplete"
+	}
+
+	fmt.Printf("\n=== Capture Health ===\n")
+	fmt.Printf("Interface:      %s\n", c.iface)
+	fmt.Printf("Filter:         %s\n", c.filter)
+	fmt.Printf("Snaplen:        %d\n", c.snaplen)
+	fmt.Printf("Uptime:         %s\n\n", uptime)
+	fmt.Printf("Packets:\n")
+	fmt.Printf("  received:     %d\n", s.PacketsReceived)
+	fmt.Printf("  processed:    %d\n", s.PacketsProcessed)
+	fmt.Printf("  truncated:    %d\n", s.PacketsTruncated)
+	fmt.Printf("  decode err:   %d\n", s.DecodeErrors)
+	fmt.Printf("  no IP layer:  %d\n", s.NoIPLayer)
+	fmt.Printf("  short pkts:   %d\n\n", s.ShortPackets)
+	fmt.Printf("Bytes:\n")
+	fmt.Printf("  received:     %s\n", humanBytes(s.BytesReceived))
+	fmt.Printf("  processed:    %s\n\n", humanBytes(s.BytesProcessed))
+	fmt.Printf("Quality:        %s\n", quality)
+
+	if quality == "⚠ incomplete" {
+		fmt.Printf("⚠  Вывод может быть неполным — часть пакетов потеряна или усечена.\n")
+	}
+}
+
+// printAnomalies выводит сводку подозрительных доменов, обогащённую процессами.
+func (c *Capture) printAnomalies() {
+	if c.anomaly == nil {
+		return
+	}
+
+	records := c.anomaly.CollectAnomalies(anomalyWindow)
+	if len(records) == 0 {
 		return
 	}
 
 	flows := c.flows.Snapshot()
-	for _, f := range flows {
-		if f.SNI == "" {
-			continue
-		}
-		if f.Class == ClassDirect || f.Class == ClassUnknown {
-			continue
-		}
-		allowed := false
-		for _, d := range c.policy.AllowDirect {
-			if d == f.SNI {
-				allowed = true
-				break
+
+	// Процесс для домена: сначала по SNI, затем по IP из DNS-маппинга.
+	findProcess := func(domain string) string {
+		for _, f := range flows {
+			if f.SNI == domain && f.Comm != "" {
+				return fmt.Sprintf("%s(%d)", f.Comm, f.PID)
 			}
 		}
-		if allowed {
-			c.addViolation(policy.Violation{
-				Rule:     "direct_outbound",
-				Expected: "direct",
-				Actual:   f.SNI,
-				Detail:   fmt.Sprintf("class=proxy, remote=%s", f.Key.RemoteIP),
-			})
+		if c.dnsMapping == nil {
+			return ""
 		}
+		for _, ip := range c.dnsMapping.IPsForName(domain) {
+			for _, f := range flows {
+				if f.Key.RemoteIP == ip && f.Comm != "" {
+					return fmt.Sprintf("%s(%d)", f.Comm, f.PID)
+				}
+			}
+		}
+		return ""
+	}
+
+	for i := range records {
+		if records[i].Process != "" {
+			continue
+		}
+		if proc := findProcess(records[i].Domain); proc != "" {
+			records[i].Process = proc
+			c.anomaly.SetProcessForDomain(records[i].Domain, proc)
+		}
+	}
+
+	c.anomaly.PrintAnomalies(anomalyWindow)
+}
+
+// --- Policy ---
+
+func (c *Capture) addViolation(v policy.Violation) {
+	c.violationsMu.Lock()
+	defer c.violationsMu.Unlock()
+
+	if c.violationSeen == nil {
+		c.violationSeen = make(map[string]bool)
+	}
+	key := v.Rule + "\x00" + v.Actual
+	if c.violationSeen[key] {
+		return
+	}
+	c.violationSeen[key] = true
+	c.violations = append(c.violations, v)
+}
+
+// checkDirectOutbound: домены из allow_direct должны идти напрямую,
+// а не через прокси.
+func (c *Capture) checkDirectOutbound() {
+	if c.policy == nil || len(c.policy.AllowDirect) == 0 {
+		return
+	}
+	for _, f := range c.flows.Snapshot() {
+		if f.SNI == "" || f.Class == ClassDirect || f.Class == ClassUnknown {
+			continue
+		}
+		if !slices.Contains(c.policy.AllowDirect, f.SNI) {
+			continue
+		}
+		c.addViolation(policy.Violation{
+			Rule:     "direct_outbound",
+			Expected: "direct",
+			Actual:   f.SNI,
+			Detail:   fmt.Sprintf("class=proxy, remote=%s", f.Key.RemoteIP),
+		})
 	}
 }
 
@@ -215,376 +790,25 @@ func (c *Capture) printPolicyViolations() {
 	fmt.Println()
 }
 
-func (c *Capture) SetPolicy(p *policy.Policy) { c.policy = p }
+// --- TCP options ---
 
-func (c *Capture) Run() {
-	packets := c.handle.Listen()
-
-	c.stats.StartedAt = time.Now()
-
-	// Горутина печати — отдельно от чтения пакетов
-	printDone := make(chan struct{})
-	go func() {
-		defer close(printDone)
-		c.printLoop()
-	}()
-
-	// Горутина enrich — отдельно
-	enrichDone := make(chan struct{})
-	go func() {
-		defer close(enrichDone)
-		c.enrichLoop()
-	}()
-
-	// Основной цикл: только чтение пакетов
-	for {
-		select {
-		case <-c.stopCh:
-			// Ждём завершения printLoop и enrichLoop
-			<-printDone
-			<-enrichDone
-			return
-		case pkt, ok := <-packets:
-			if !ok {
-				return
-			}
-			c.processData(pkt.B)
-		}
+func tcpFlagsOf(tcp *layers.TCP) TCPFlags {
+	tf := TCPFlags{
+		SYN: tcp.SYN, ACK: tcp.ACK, FIN: tcp.FIN, RST: tcp.RST, PSH: tcp.PSH,
+		Payload: tcp.Payload,
 	}
-}
-
-func (c *Capture) Stop() {
-	c.stopOnce.Do(func() {
-		close(c.stopCh)
-	})
-}
-
-func (c *Capture) Close() {
-	c.Stop()
-	if c.handle != nil {
-		c.handle.Close()
+	if tcp.SYN && !tcp.ACK { // открытие соединения — опции имеют смысл только тут
+		tf.MSS = extractMSS(tcp.Options)
+		tf.WindowScale = extractWindowScale(tcp.Options)
+		tf.HasTimestamps = hasOption(tcp.Options, layers.TCPOptionKindTimestamps)
+		tf.HasSACK = hasOption(tcp.Options, layers.TCPOptionKindSACKPermitted)
 	}
-	if c.pcapFile != nil {
-		c.pcapFile.Close()
-	}
-	CloseGeoIP()
-}
-
-func (c *Capture) processData(data []byte) {
-
-	c.stats.mu.Lock()
-	c.stats.PacketsReceived++
-	c.stats.BytesReceived += uint64(len(data))
-	c.stats.mu.Unlock()
-
-	packet := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.Default)
-
-	// Проверяем ошибки декодирования
-	if errLayer := packet.ErrorLayer(); errLayer != nil {
-		c.stats.mu.Lock()
-		c.stats.DecodeErrors++
-		c.stats.mu.Unlock()
-		return
-	}
-
-	// Проверяем усечение пакета (snaplen)
-	if meta := packet.Metadata(); meta != nil {
-		if meta.CaptureLength > 0 && meta.Length > 0 && meta.CaptureLength < meta.Length {
-			c.stats.mu.Lock()
-			c.stats.PacketsTruncated++
-			c.stats.mu.Unlock()
-		}
-	}
-
-	ipLayer := packet.NetworkLayer()
-	tcpLayer := packet.Layer(layers.LayerTypeTCP)
-	udpLayer := packet.Layer(layers.LayerTypeUDP)
-
-	if ipLayer == nil {
-		c.stats.mu.Lock()
-		c.stats.NoIPLayer++
-		c.stats.mu.Unlock()
-		return
-	}
-
-	c.stats.mu.Lock()
-	c.stats.PacketsProcessed++
-	c.stats.BytesProcessed += uint64(len(data))
-	c.stats.mu.Unlock()
-
-	var srcIP, dstIP string
-	switch ip := ipLayer.(type) {
-	case *layers.IPv4:
-		srcIP = ip.SrcIP.String()
-		dstIP = ip.DstIP.String()
-	case *layers.IPv6:
-		srcIP = ip.SrcIP.String()
-		dstIP = ip.DstIP.String()
-	}
-
-	// Policy: IPv6 запрещён
-	if c.policy != nil && !c.policy.IsIPv6Allowed() {
-		if _, ok := ipLayer.(*layers.IPv6); ok {
-			c.addViolation(policy.Violation{
-				Rule:     "ipv6",
-				Expected: "disabled",
-				Actual:   fmt.Sprintf("%s → %s", srcIP, dstIP),
-				Detail:   "IPv6-трафик при policy.ipv6=false",
-			})
-		}
-	}
-
-	proto := "OTHER"
-	var srcPort, dstPort uint16
-	var tf TCPFlags
-	var payload []byte
-	var seq uint32
-
-	if tcpLayer != nil {
-		tcp := tcpLayer.(*layers.TCP)
-		proto = "TCP"
-		srcPort = uint16(tcp.SrcPort)
-		dstPort = uint16(tcp.DstPort)
-		payload = tcp.Payload
-		seq = tcp.Seq
-
-		tf = TCPFlags{
-			SYN: tcp.SYN, ACK: tcp.ACK, FIN: tcp.FIN, RST: tcp.RST, PSH: tcp.PSH,
-			Payload: tcp.Payload,
-		}
-
-		if tcp.SYN && !tcp.ACK {
-			tf.MSS = extractMSS(tcp.Options)
-			tf.WindowScale = extractWindowScale(tcp.Options)
-			tf.HasTimestamps = hasOption(tcp.Options, 8)
-			tf.HasSACK = hasOption(tcp.Options, 4)
-		}
-	} else if udpLayer != nil {
-		udp := udpLayer.(*layers.UDP)
-		proto = "UDP"
-		srcPort = uint16(udp.SrcPort)
-		dstPort = uint16(udp.DstPort)
-		payload = udp.Payload
-	}
-
-	var isOutbound bool
-	if c.routerMode {
-		srcIsLAN := isLANIP(srcIP)
-		dstIsLAN := isLANIP(dstIP)
-
-		switch {
-		case srcIsLAN && !dstIsLAN:
-			isOutbound = true
-		case !srcIsLAN && dstIsLAN:
-			isOutbound = false
-		case srcIsLAN && dstIsLAN:
-			isOutbound = !c.localIPs[srcIP]
-		default:
-			isOutbound = false
-		}
-	} else {
-		isOutbound = c.localIPs[srcIP]
-	}
-
-	c.flows.Update(srcIP, srcPort, dstIP, dstPort, proto, len(data), isOutbound, tf, seq)
-
-	// SNI: аккумулируем payload и пытаемся извлечь (работает с фрагментацией)
-	if proto == "TCP" && dstPort == 443 && len(payload) > 0 {
-		key := FlowKey{
-			LocalIP:    srcIP,
-			LocalPort:  srcPort,
-			RemoteIP:   dstIP,
-			RemotePort: dstPort,
-			Proto:      proto,
-		}
-		if sni := c.flows.AppendPayload(key, payload); sni != "" && c.anomaly != nil {
-			c.anomaly.MarkConnected(sni)
-		}
-	}
-
-	// DNS-парсер (UDP/53, UDP/5353, TCP/53)
-	if len(payload) > 0 {
-		if (proto == "UDP" && (srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353)) ||
-			(proto == "TCP" && (srcPort == 53 || dstPort == 53)) {
-			c.dnsTable.Update(payload, srcIP, dstIP, srcPort, dstPort, proto)
-
-			// Если это запрос (dstPort == 53) — проверяем аномалии
-			if dstPort == 53 {
-			}
-			if (dstPort == 53 || dstPort == 5353) && c.anomaly != nil {
-				if name, qtype, ok := parseDNSQuery(payload); ok {
-					if leak := c.anomaly.CheckDNSLeak(dstIP, name); leak != "" {
-						c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, leak)
-					}
-					if flag := c.anomaly.CheckDomain(name, true); flag != "" {
-						c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
-					}
-					if c.anomaly != nil {
-						c.anomaly.RecordDNSOnly(name)
-					}
-					// Policy: разрешён ли резолвер
-					if c.policy != nil {
-						fmt.Fprintf(os.Stderr, "[POLICY-DBG] resolver=%s allowed=%v\n", dstIP, c.policy.IsResolverAllowed(dstIP))
-						if !c.policy.IsResolverAllowed(dstIP) {
-							flag := fmt.Sprintf("⚠POLICY-DNS→%s", dstIP)
-							c.dnsTable.SetFlags(name, qtype, srcIP, dstIP, flag)
-						}
-					}
-				}
-			}
-
-			// Если это ответ — строим маппинг name → IP
-			if srcPort == 53 || srcPort == 5353 {
-				c.dnsMapping.Update(payload, dstIP, srcIP) // было Update(payload)
-			}
-		}
-	}
-
-	// QUIC-парсер: только UDP/443, только Initial
-	if proto == "UDP" && len(payload) > 0 && (srcPort == 443 || dstPort == 443) {
-		if sni := extractQUICSNI(payload, srcIP, dstIP, srcPort, dstPort); sni != "" {
-			key := FlowKey{
-				LocalIP:    srcIP,
-				LocalPort:  srcPort,
-				RemoteIP:   dstIP,
-				RemotePort: dstPort,
-				Proto:      proto,
-			}
-			// Определяем локальную сторону для нормализации
-			if srcPort == 443 {
-				key = FlowKey{
-					LocalIP:    dstIP,
-					LocalPort:  dstPort,
-					RemoteIP:   srcIP,
-					RemotePort: srcPort,
-					Proto:      proto,
-				}
-			}
-			c.flows.SetSNI(key, sni)
-			if c.anomaly != nil {
-				c.anomaly.MarkConnected(sni)
-			}
-		}
-	}
-
-	// VPN-детект: только для исходящих пакетов, только первый пакет потока
-	if isOutbound && len(payload) > 0 && (proto == "UDP" || proto == "TCP") {
-		if det := detectVPN(payload, srcIP, dstIP, srcPort, dstPort); det != nil {
-			c.flows.MarkVPN(srcIP, srcPort, dstIP, dstPort, proto, det)
-		}
-	}
-}
-
-func (c *Capture) printLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopCh:
-			c.printAll()
-			return
-		case <-ticker.C:
-			c.printAll()
-		}
-	}
-}
-
-func (c *Capture) enrichLoop() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopCh:
-			c.flows.Enrich()
-			return
-		case <-ticker.C:
-			c.flows.Enrich()
-		}
-	}
-}
-
-func (c *Capture) printAll() {
-	if c.quiet {
-		return
-	}
-
-	if c.baselineRef != nil {
-		c.printBaselineDiffJSON(c.baselineRef)
-	}
-
-	if c.outputMode == "json" {
-		c.printAllJSON()
-		return
-	}
-
-	// текстовый режим — как раньше
-	c.flows.Enrich()
-	if c.groupBy == "app" || c.groupBy == "device" {
-		c.flows.PrintApps()
-	} else {
-		c.flows.Print()
-	}
-	c.dnsTable.Print()
-	printAttribution(c.flows.Snapshot(), c.dnsMapping)
-	printProxySuspicions(c.flows.Snapshot(), c.dnsMapping, c.anomaly)
-	printProxyProcesses(c.flows.Snapshot())
-	c.printAnomalies()
-	c.flows.PrintProfile(c.profileSNI)
-	c.checkDirectOutbound()
-	c.printPolicyViolations()
-	// LAN inventory (только в router-mode)
-	if c.routerMode {
-		c.flows.PrintDevices()
-	}
-
-	c.printHealth()
-
-	if c.anomaly != nil {
-		c.anomaly.SaveHistory()
-	}
-}
-
-func (c *Capture) printHealth() {
-	c.stats.mu.Lock()
-	s := c.stats
-	c.stats.mu.Unlock()
-
-	uptime := time.Since(s.StartedAt).Truncate(time.Second)
-
-	quality := "✓ complete"
-	if s.PacketsTruncated > 0 || s.DecodeErrors > 0 {
-		quality = "⚠ incomplete"
-	}
-
-	fmt.Printf("\n=== Capture Health ===\n")
-	fmt.Printf("Interface:      %s\n", c.iface)
-	fmt.Printf("Filter:         %s\n", c.filter)
-	fmt.Printf("Snaplen:        %d\n", c.snaplen)
-	fmt.Printf("Uptime:         %s\n", uptime)
-	fmt.Printf("\n")
-	fmt.Printf("Packets:\n")
-	fmt.Printf("  received:     %d\n", s.PacketsReceived)
-	fmt.Printf("  processed:    %d\n", s.PacketsProcessed)
-	fmt.Printf("  truncated:    %d\n", s.PacketsTruncated)
-	fmt.Printf("  decode err:   %d\n", s.DecodeErrors)
-	fmt.Printf("  no IP layer:  %d\n", s.NoIPLayer)
-	fmt.Printf("\n")
-	fmt.Printf("Bytes:\n")
-	fmt.Printf("  received:     %s\n", humanBytes(s.BytesReceived))
-	fmt.Printf("  processed:    %s\n", humanBytes(s.BytesProcessed))
-	fmt.Printf("\n")
-	fmt.Printf("Quality:        %s\n", quality)
-
-	if quality == "⚠ incomplete" {
-		fmt.Printf("⚠  Вывод может быть неполным — часть пакетов потеряна или усечена.\n")
-	}
+	return tf
 }
 
 func extractMSS(opts []layers.TCPOption) uint16 {
 	for _, o := range opts {
-		if o.OptionType == 2 && len(o.OptionData) >= 2 {
+		if o.OptionType == layers.TCPOptionKindMSS && len(o.OptionData) >= 2 {
 			return uint16(o.OptionData[0])<<8 | uint16(o.OptionData[1])
 		}
 	}
@@ -593,7 +817,7 @@ func extractMSS(opts []layers.TCPOption) uint16 {
 
 func extractWindowScale(opts []layers.TCPOption) uint8 {
 	for _, o := range opts {
-		if o.OptionType == 3 && len(o.OptionData) >= 1 {
+		if o.OptionType == layers.TCPOptionKindWindowScale && len(o.OptionData) >= 1 {
 			return o.OptionData[0]
 		}
 	}
@@ -609,57 +833,7 @@ func hasOption(opts []layers.TCPOption, kind layers.TCPOptionKind) bool {
 	return false
 }
 
-// printAnomalies выводит сводку подозрительных доменов с процессами.
-func (c *Capture) printAnomalies() {
-	if c.anomaly == nil {
-		return
-	}
-
-	records := c.anomaly.CollectAnomalies(5 * time.Minute)
-	if len(records) == 0 {
-		return
-	}
-
-	// Обогащаем процессы
-	flows := c.flows.Snapshot()
-
-	for i := range records {
-		if records[i].Process != "" {
-			continue
-		}
-
-		// 1. Ищем процесс по SNI (прямое совпадение)
-		for _, f := range flows {
-			if f.SNI == records[i].Domain && f.Comm != "" {
-				records[i].Process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
-				break
-			}
-		}
-
-		// 2. Если не нашли — ищем по IP, в который резолвился домен
-		if records[i].Process == "" && c.dnsMapping != nil {
-			ips := c.dnsMapping.IPsForName(records[i].Domain)
-			for _, ip := range ips {
-				for _, f := range flows {
-					if f.Key.RemoteIP == ip && f.Comm != "" {
-						records[i].Process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
-						break
-					}
-				}
-				if records[i].Process != "" {
-					break
-				}
-			}
-		}
-
-		// 3. Обновляем запись в детекторе
-		if records[i].Process != "" {
-			c.anomaly.SetProcessForDomain(records[i].Domain, records[i].Process)
-		}
-	}
-
-	c.anomaly.PrintAnomalies(5 * time.Minute)
-}
+// --- Утилиты ---
 
 // isLANIP определяет, является ли IP локальным (RFC1918 или link-local).
 func isLANIP(ip string) bool {
@@ -667,10 +841,11 @@ func isLANIP(ip string) bool {
 	if parsed == nil {
 		return false
 	}
-	if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() {
+	if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() || parsed.IsPrivate() {
 		return true
 	}
-	if parsed.IsPrivate() {
+	// Multicast (224.0.0.0/4, ff00::/8) — локальный
+	if parsed.IsMulticast() {
 		return true
 	}
 	// IPv6 ULA (fc00::/7)
@@ -691,24 +866,20 @@ func (c *Capture) BuildBaseline() *baseline.Baseline {
 	ja4 := make(map[string]string)
 
 	for _, f := range flows {
-		// Домены
 		if f.SNI != "" {
 			domainsSet[f.SNI] = true
 		} else if f.Hostname != "" {
 			domainsSet[f.Hostname] = true
 		}
-
-		// Процессы (только реальные процессы, не IP)
 		if f.Comm != "" {
 			procsSet[f.Comm] = true
 		}
-		// Устройства
 		if f.Key.LocalIP != "" {
 			devicesSet[f.Key.LocalIP] = true
 		}
 
-		// JA3/JA4 — по процессу.
-		// Пропускаем proxy/vpn — у них JA3/JA4 меняется каждый сеанс.
+		// JA3/JA4 — по процессу. Пропускаем proxy/vpn:
+		// у них JA3/JA4 меняется каждый сеанс.
 		if f.Comm != "" && f.Class != ClassProxy && f.Class != ClassVPN {
 			if f.JA3 != "" {
 				ja3[f.Comm] = f.JA3

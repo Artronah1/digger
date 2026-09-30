@@ -33,9 +33,15 @@ func looksLikeProxyProcess(comm string) bool {
 	return false
 }
 
+const (
+	sniCacheTTL   = 5 * time.Minute
+	sniCacheSweep = time.Minute
+)
+
 var (
-	sniCache   = make(map[string]cachedResolve)
-	sniCacheMu sync.Mutex
+	sniCache      = make(map[string]cachedResolve)
+	sniCacheMu    sync.Mutex
+	sniCacheSwept time.Time
 )
 
 type cachedResolve struct {
@@ -43,32 +49,48 @@ type cachedResolve struct {
 	resolved time.Time
 }
 
-// resolveSNI резолвит домен через системный DNS и возвращает список IP.
-// Кэширует на 5 минут.
+// resolveSNI резолвит домен через системный DNS. ВНИМАНИЕ: блокирующий
+// вызов — из-под локов не звать (см. прогрев кэша в FlowTable.Enrich).
+// IPv4 И IPv6: только IPv4 давал "not-resolved" для IPv6-only доменов
+// и ложный класс proxy.
 func resolveSNI(sni string) []string {
+	now := time.Now()
+
 	sniCacheMu.Lock()
-	if c, ok := sniCache[sni]; ok && time.Since(c.resolved) < 5*time.Minute {
+	if c, ok := sniCache[sni]; ok && now.Sub(c.resolved) < sniCacheTTL {
 		ips := c.ips
 		sniCacheMu.Unlock()
 		return ips
 	}
 	sniCacheMu.Unlock()
 
-	addrs, err := net.LookupIP(sni)
-	if err != nil {
-		addrs = nil
-	}
-	var ips []string
-	for _, a := range addrs {
-		if v4 := a.To4(); v4 != nil {
-			ips = append(ips, v4.String())
-		}
-	}
+	ips := resolveSNIUncached(sni) // блокирующий DNS — без лока
 
 	sniCacheMu.Lock()
-	sniCache[sni] = cachedResolve{ips: ips, resolved: time.Now()}
+	sniCache[sni] = cachedResolve{ips: ips, resolved: now}
+	// Карта никогда не чистилась — росла бесконечно.
+	if now.Sub(sniCacheSwept) > sniCacheSweep {
+		sniCacheSwept = now
+		for k, c := range sniCache {
+			if now.Sub(c.resolved) > 2*sniCacheTTL {
+				delete(sniCache, k)
+			}
+		}
+	}
 	sniCacheMu.Unlock()
 
+	return ips
+}
+
+func resolveSNIUncached(sni string) []string {
+	addrs, err := net.LookupIP(sni)
+	if err != nil {
+		return nil
+	}
+	ips := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		ips = append(ips, a.String())
+	}
 	return ips
 }
 
@@ -84,9 +106,12 @@ func sniResolvesToIP(sni, ip string) bool {
 }
 
 // ResolveResult — результат проверки SNI ↔ IP.
+// Reason: "matched" | "different-ip" | "not-resolved" | "no-mapping".
+// ("no-observation" из комментариев — мёртвое значение, никогда
+// не возвращается; ветки под него в ClassifyFlow/attribution недостижимы.)
 type ResolveResult struct {
 	Matches     bool
-	Reason      string // "matched" | "no-observation" | "different-ip" | "not-resolved" | "no-mapping"
+	Reason      string
 	ObservedIPs []string
 }
 
@@ -105,7 +130,7 @@ func resolveSNIAt(sni, ip string, at time.Time, mapping *DNSMapping) ResolveResu
 		return ResolveResult{Reason: "different-ip", ObservedIPs: ips}
 	}
 
-	// 1. Проверяем наблюдения в момент at
+	// 1. Наблюдения DNS в момент at.
 	names := mapping.NamesForIPAt(ip, at)
 	for _, n := range names {
 		if n == sni {
@@ -113,23 +138,17 @@ func resolveSNIAt(sni, ip string, at time.Time, mapping *DNSMapping) ResolveResu
 		}
 	}
 
-	// 2. Наблюдений нет — резолвим сами
+	// 2. Наблюдений нет — резолвим сами (блокирующий вызов!).
 	ips := resolveSNI(sni)
 	if len(ips) == 0 {
 		return ResolveResult{Reason: "not-resolved"}
 	}
-
-	// 3. Резолвится — но в другой IP?
 	for _, r := range ips {
 		if r == ip {
 			return ResolveResult{Matches: true, Reason: "matched", ObservedIPs: ips}
 		}
 	}
 
-	// 4. Резолвится, но в другой IP — CDN-балансировка, не прокси
-	return ResolveResult{
-		Matches:     false,
-		Reason:      "different-ip",
-		ObservedIPs: ips,
-	}
+	// 3. Резолвится в другой IP — CDN-балансировка, не прокси.
+	return ResolveResult{Matches: false, Reason: "different-ip", ObservedIPs: ips}
 }

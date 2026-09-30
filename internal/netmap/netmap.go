@@ -1,9 +1,11 @@
 package netmap
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Snapshot содержит снимок сетевой конфигурации ядра.
@@ -81,10 +83,14 @@ func printOrEmpty(s string) {
 	}
 }
 
+const cmdTimeout = 5 * time.Second
+
 func runCmd(name string, args ...string) string {
-	out, err := exec.Command(name, args...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).Output()
 	if err != nil {
-		return ""
+		return "" // нет утилиты / нет прав / таймаут
 	}
 	return strings.TrimRight(string(out), "\n")
 }

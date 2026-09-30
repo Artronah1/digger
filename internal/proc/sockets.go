@@ -27,19 +27,33 @@ type SocketInfo struct {
 // ScanSockets читает /proc/net/tcp и /proc/net/tcp6: 5-tuple -> inode.
 func ScanSockets() (map[SocketKey]uint64, error) {
 	result := make(map[SocketKey]uint64)
+	scanProcTCP([]string{"/proc/net/tcp", "/proc/net/tcp6"}, func(key SocketKey, inode uint64) {
+		result[key] = inode
+	})
+	return result, nil
+}
 
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+// ScanSocketsByLocalPort — индекс по локальному порту (fallback).
+func ScanSocketsByLocalPort() (map[uint16]uint64, error) {
+	result := make(map[uint16]uint64)
+	scanProcTCP([]string{"/proc/net/tcp", "/proc/net/tcp6"}, func(key SocketKey, inode uint64) {
+		result[key.LocalPort] = inode
+	})
+	return result, nil
+}
+
+// scanProcTCP обходит /proc/net/tcp*. Фильтр: LISTEN (st=0A) не нужен
+// никому, а записи с inode=0 (TIME_WAIT) раньше ЗАТИРАЛИ живой сокет
+// в индексе по порту.
+func scanProcTCP(paths []string, fn func(SocketKey, uint64)) {
+	for _, path := range paths {
 		f, err := os.Open(path)
 		if err != nil {
 			continue
 		}
 		scanner := bufio.NewScanner(f)
-		first := true
+		scanner.Scan() // заголовок
 		for scanner.Scan() {
-			if first {
-				first = false
-				continue
-			}
 			fields := strings.Fields(scanner.Text())
 			if len(fields) < 10 {
 				continue
@@ -53,64 +67,37 @@ func ScanSockets() (map[SocketKey]uint64, error) {
 			if err != nil {
 				continue
 			}
+			if fields[3] == "0A" { // LISTEN
+				continue
+			}
 			inode, err := strconv.ParseUint(fields[9], 10, 64)
-			if err != nil {
+			if err != nil || inode == 0 {
 				continue
 			}
 
-			key := SocketKey{
-				LocalIP:    local.IP.String(),
+			fn(SocketKey{
+				LocalIP:    local.String(),
 				LocalPort:  local.Port,
-				RemoteIP:   remote.IP.String(),
+				RemoteIP:   remote.String(),
 				RemotePort: remote.Port,
-			}
-			result[key] = inode
+			}, inode)
 		}
 		f.Close()
 	}
-	return result, nil
-}
-
-// ScanSocketsByLocalPort — альтернативный индекс по локальному порту.
-// Более надёжен для матчинга с pcap, т.к. локальный порт уникален
-// для активного соединения и не меняется.
-func ScanSocketsByLocalPort() (map[uint16]uint64, error) {
-	result := make(map[uint16]uint64)
-
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
-		f, err := os.Open(path)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		first := true
-		for scanner.Scan() {
-			if first {
-				first = false
-				continue
-			}
-			fields := strings.Fields(scanner.Text())
-			if len(fields) < 10 {
-				continue
-			}
-			local, err := parseHexAddr(fields[1])
-			if err != nil {
-				continue
-			}
-			inode, err := strconv.ParseUint(fields[9], 10, 64)
-			if err != nil {
-				continue
-			}
-			result[local.Port] = inode
-		}
-		f.Close()
-	}
-	return result, nil
 }
 
 type SocketAddr struct {
 	IP   net.IP
 	Port uint16
+}
+
+// String нормализует IPv4-mapped IPv6 (::ffff:1.2.3.4 из tcp6) к IPv4 —
+// иначе ключ не совпадает с адресом из пакета.
+func (a SocketAddr) String() string {
+	if v4 := a.IP.To4(); v4 != nil {
+		return v4.String()
+	}
+	return a.IP.String()
 }
 
 func parseHexAddr(s string) (SocketAddr, error) {
@@ -131,9 +118,9 @@ func parseHexAddr(s string) (SocketAddr, error) {
 
 	var ip net.IP
 	switch len(ipBytes) {
-	case 4:
+	case 4: // little-endian dword
 		ip = net.IPv4(ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0])
-	case 16:
+	case 16: // 4 little-endian dword'а
 		ip = make(net.IP, 16)
 		for i := 0; i < 4; i++ {
 			ip[i*4+0] = ipBytes[i*4+3]

@@ -51,38 +51,36 @@ func DescribeMAC(mac string) string {
 		return "unknown"
 	}
 
-	// Парсим первые 3 байта
 	parts := strings.Split(mac, ":")
 	if len(parts) < 3 {
 		return "unknown"
 	}
 
-	firstByte := parseHexByte(parts[0])
-	if firstByte == 0 {
+	// БАГ: parseHexByte отдавал 0 и как ошибку, и как значение —
+	// любой OUI с первым октетом 00 (Apple, Realtek, Intel, половина
+	// таблицы) возвращал "unknown".
+	firstByte, ok := parseHexByte(parts[0])
+	if !ok {
 		return "unknown"
 	}
 
-	// Multicast (младший бит первого байта = 1)
-	if firstByte&0x01 != 0 {
+	if firstByte&0x01 != 0 { // бит I/G
 		return "multicast"
 	}
-	// Locally administered (второй бит = 1)
-	if firstByte&0x02 != 0 {
+	if firstByte&0x02 != 0 { // locally administered
 		return "random-mac"
 	}
 
-	// OUI lookup
 	oui := strings.ToUpper(parts[0] + ":" + parts[1] + ":" + parts[2])
 	if vendor, ok := ouiTable[oui]; ok {
 		return vendor
 	}
-
 	return oui
 }
 
-func parseHexByte(s string) byte {
+func parseHexByte(s string) (byte, bool) {
 	if len(s) != 2 {
-		return 0
+		return 0, false
 	}
 	var b byte
 	for i := 0; i < 2; i++ {
@@ -96,11 +94,11 @@ func parseHexByte(s string) byte {
 		case c >= 'A' && c <= 'F':
 			v = c - 'A' + 10
 		default:
-			return 0
+			return 0, false
 		}
 		b = b<<4 | v
 	}
-	return b
+	return b, true
 }
 
 // Мини-база OUI для популярных вендоров.

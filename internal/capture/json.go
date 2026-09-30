@@ -1,15 +1,14 @@
 package capture
 
 import (
-	"digger/internal/baseline"
-	"digger/internal/policy"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"digger/internal/baseline"
 )
 
 // schemaVersion — версия схемы JSON. При breaking changes — увеличивать.
@@ -17,46 +16,20 @@ const schemaVersion = 1
 
 func diggerVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
-		if info.Main.Version != "" && info.Main.Version != "(devel)" {
-			return info.Main.Version
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
 		}
 	}
 	return "dev"
 }
+
+// --- Общие хелперы ---
 
 // Event — общая обёртка для всех JSON-событий.
 type Event struct {
 	Schema int    `json:"schema"`
 	TS     string `json:"ts"`
 	Kind   string `json:"kind"`
-}
-
-type PolicyViolationEvent struct {
-	Event
-	Cycle    int    `json:"cycle"`
-	Rule     string `json:"rule"`
-	Expected string `json:"expected"`
-	Actual   string `json:"actual"`
-	Detail   string `json:"detail"`
-}
-
-func (c *Capture) printPolicyViolationsJSON() {
-	c.violationsMu.Lock()
-	vs := make([]policy.Violation, len(c.violations))
-	copy(vs, c.violations)
-	c.violationsMu.Unlock()
-
-	for _, v := range vs {
-		ev := PolicyViolationEvent{
-			Event:    newEvent("policy_violation"),
-			Cycle:    c.printCycle,
-			Rule:     v.Rule,
-			Expected: v.Expected,
-			Actual:   v.Actual,
-			Detail:   v.Detail,
-		}
-		printJSON(ev)
-	}
 }
 
 func newEvent(kind string) Event {
@@ -77,7 +50,49 @@ func printJSON(v any) {
 	fmt.Println(string(data))
 }
 
-// SnapshotEvent — мета о запуске.
+// fmtTime — единый формат времени в событиях.
+func fmtTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// stripReconNote убирает суффикс " ⚠gap"/" ⚠partial", который Aggregate
+// добавляет к Label ради текстового вывода. В JSON recon идёт отдельным
+// полем, а суффикс иначе уезжает и в label.
+func stripReconNote(label string) string {
+	for _, note := range []string{" ⚠gap", " ⚠partial"} {
+		label = strings.TrimSuffix(label, note)
+	}
+	return label
+}
+
+// --- Точка входа ---
+
+// printAllJSON — общая точка входа для JSON-режима.
+// Снимок flows берётся ОДИН раз на цикл: раньше Snapshot() копировался
+// пять раз, и события одного цикла снимались в разные моменты времени.
+// Номер цикла (printCycle) инкрементируется в printAll — см. capture.go.
+func (c *Capture) printAllJSON() {
+	flows := c.flows.Snapshot()
+
+	c.printMetaJSON()
+	c.printHealthJSON()
+	c.printFlowsJSON(flows)
+	c.printDNSJSON()
+	c.printAttributionJSON(flows)
+	c.printProxySuspicionsJSON(flows)
+	c.printProxyProcessesJSON(flows)
+	c.printAnomaliesJSON()
+	c.printDNSObservationsJSON()
+	c.printDeviceGroupsJSON(flows)
+	c.printDevicesJSON(flows)
+	c.checkDirectOutbound()
+	c.printPolicyViolationsJSON()
+}
+
+// --- Метаданные и health ---
+
+// SnapshotEvent — метаданные запуска (kind "snapshot" оставлен
+// для совместимости схемы).
 type SnapshotEvent struct {
 	Event
 	Cycle   int    `json:"cycle"`
@@ -86,6 +101,19 @@ type SnapshotEvent struct {
 	Snaplen int    `json:"snaplen"`
 	Version string `json:"version"`
 	Uptime  int64  `json:"uptime_sec"`
+}
+
+// printMetaJSON — метаданные в начале цикла.
+func (c *Capture) printMetaJSON() {
+	printJSON(SnapshotEvent{
+		Event:   newEvent("snapshot"),
+		Cycle:   c.printCycle,
+		Iface:   c.iface,
+		Filter:  c.filter,
+		Snaplen: c.snaplen,
+		Version: diggerVersion(),
+		Uptime:  int64(time.Since(c.statsSnapshot().StartedAt).Seconds()),
+	})
 }
 
 // HealthEvent — счётчики Capture Health.
@@ -101,33 +129,91 @@ type HealthEvent struct {
 	PacketsTruncated uint64 `json:"packets_truncated"`
 	DecodeErrors     uint64 `json:"decode_errors"`
 	NoIPLayer        uint64 `json:"no_ip_layer"`
+	ShortPackets     uint64 `json:"short_packets"`
 	BytesReceived    uint64 `json:"bytes_received"`
 	BytesProcessed   uint64 `json:"bytes_processed"`
 	Quality          string `json:"quality"`
 }
 
+// printHealthJSON — статистика захвата.
+func (c *Capture) printHealthJSON() {
+	s := c.statsSnapshot()
+
+	quality := "complete"
+	if s.PacketsTruncated > 0 || s.DecodeErrors > 0 {
+		quality = "incomplete"
+	}
+
+	printJSON(HealthEvent{
+		Event:            newEvent("health"),
+		Cycle:            c.printCycle,
+		Iface:            c.iface,
+		Filter:           c.filter,
+		Snaplen:          c.snaplen,
+		UptimeSec:        int64(time.Since(s.StartedAt).Seconds()),
+		PacketsReceived:  s.PacketsReceived,
+		PacketsProcessed: s.PacketsProcessed,
+		PacketsTruncated: s.PacketsTruncated,
+		DecodeErrors:     s.DecodeErrors,
+		NoIPLayer:        s.NoIPLayer,
+		ShortPackets:     s.ShortPackets,
+		BytesReceived:    s.BytesReceived,
+		BytesProcessed:   s.BytesProcessed,
+		Quality:          quality,
+	})
+}
+
+// --- Baseline ---
+
 // BaselineDiffEvent — различие с baseline.
 type BaselineDiffEvent struct {
 	Event
 	Cycle    int    `json:"cycle"`
-	Kind     string `json:"diff_kind"` // "new_domain", "removed_domain", "new_process", ...
+	Kind     string `json:"diff_kind"`
 	Value    string `json:"value"`
 	OldValue string `json:"old_value,omitempty"`
 	NewValue string `json:"new_value,omitempty"`
 }
+
+// printBaselineDiffJSON печатает различия с baseline.
+func (c *Capture) printBaselineDiffJSON(old *baseline.Baseline) {
+	diff := baseline.Compare(old, c.BuildBaseline())
+
+	printDiffs := func(kind string, values []string) {
+		for _, v := range values {
+			printJSON(BaselineDiffEvent{
+				Event: newEvent("baseline_diff"),
+				Cycle: c.printCycle,
+				Kind:  kind,
+				Value: v,
+			})
+		}
+	}
+
+	printDiffs("new_domain", diff.NewDomains)
+	printDiffs("removed_domain", diff.RemovedDomains)
+	printDiffs("new_process", diff.NewProcesses)
+	printDiffs("removed_process", diff.RemovedProcesses)
+	printDiffs("new_device", diff.NewDevices)
+	printDiffs("removed_device", diff.RemovedDevices)
+	printDiffs("new_ja3", diff.NewJA3)
+	printDiffs("new_ja4", diff.NewJA4)
+	printDiffs("changed_ja3", diff.ChangedJA3)
+	printDiffs("changed_ja4", diff.ChangedJA4)
+}
+
+// --- Потоки ---
 
 // FlowEvent — один агрегированный поток.
 type FlowEvent struct {
 	Event
 
 	Cycle             int    `json:"cycle"`
-	Label             string `json:"label"` // Идентификатор потока (SNI, Hostname или IP)
+	Label             string `json:"label"`
 	Process           string `json:"process"`
-	SNI               string `json:"sni,omitempty"` // Только если Label является настоящим SNI
+	SNI               string `json:"sni,omitempty"`
+	Hostname          string `json:"hostname,omitempty"`
 	Classification    string `json:"classification"`
-	Hostname          string `json:"hostname,omitempty"` // Если Label является hostname
-	RemoteIP          string `json:"remote_ip,omitempty"`
-	RemotePort        uint16 `json:"remote_port,omitempty"`
 	Proto             string `json:"proto"`
 	Recon             string `json:"recon,omitempty"`
 	Conns             int    `json:"conns"`
@@ -150,211 +236,25 @@ type FlowEvent struct {
 	JA4               string `json:"ja4,omitempty"`
 }
 
-// printSnapshotJSON печатает мета о запуске.
-func (c *Capture) printSnapshotJSON() {
-	ev := SnapshotEvent{
-		Event:   newEvent("snapshot"),
-		Cycle:   c.printCycle,
-		Iface:   c.iface,
-		Filter:  c.filter,
-		Snaplen: c.snaplen,
-		Version: diggerVersion(),
-		Uptime:  int64(time.Since(c.stats.StartedAt).Seconds()),
-	}
-	printJSON(ev)
-}
-
-// printBaselineDiffJSON печатает различия с baseline.
-func (c *Capture) printBaselineDiffJSON(old *baseline.Baseline) {
-	current := c.BuildBaseline()
-	diff := baseline.Compare(old, current)
-
-	printDiffs := func(kind string, values []string) {
-		for _, v := range values {
-			ev := BaselineDiffEvent{
-				Event: newEvent("baseline_diff"),
-				Cycle: c.printCycle,
-				Kind:  kind,
-				Value: v,
-			}
-			printJSON(ev)
-		}
-	}
-
-	printDiffs("new_domain", diff.NewDomains)
-	printDiffs("removed_domain", diff.RemovedDomains)
-	printDiffs("new_process", diff.NewProcesses)
-	printDiffs("removed_process", diff.RemovedProcesses)
-	printDiffs("new_device", diff.NewDevices)
-	printDiffs("removed_device", diff.RemovedDevices)
-
-	for _, v := range diff.ChangedJA3 {
-		ev := BaselineDiffEvent{
-			Event: newEvent("baseline_diff"),
-			Cycle: c.printCycle,
-			Kind:  "changed_ja3",
-			Value: v,
-		}
-		printJSON(ev)
-	}
-	for _, v := range diff.ChangedJA4 {
-		ev := BaselineDiffEvent{
-			Event: newEvent("baseline_diff"),
-			Cycle: c.printCycle,
-			Kind:  "changed_ja4",
-			Value: v,
-		}
-		printJSON(ev)
-	}
-	for _, v := range diff.NewJA3 {
-		ev := BaselineDiffEvent{
-			Event: newEvent("baseline_diff"),
-			Cycle: c.printCycle,
-			Kind:  "new_ja3",
-			Value: v,
-		}
-		printJSON(ev)
-	}
-	for _, v := range diff.NewJA4 {
-		ev := BaselineDiffEvent{
-			Event: newEvent("baseline_diff"),
-			Cycle: c.printCycle,
-			Kind:  "new_ja4",
-			Value: v,
-		}
-		printJSON(ev)
-	}
-}
-
-// DeviceEvent — событие об устройстве LAN.
-type DeviceEvent struct {
-	Event
-	Cycle     int    `json:"cycle"`
-	IP        string `json:"ip"`
-	MAC       string `json:"mac,omitempty"`
-	Vendor    string `json:"vendor,omitempty"`
-	Hostname  string `json:"hostname,omitempty"`
-	Conns     int    `json:"conns"`
-	Domains   int    `json:"domains"`
-	BytesOut  uint64 `json:"bytes_out"`
-	BytesIn   uint64 `json:"bytes_in"`
-	FirstSeen string `json:"first_seen"`
-	LastSeen  string `json:"last_seen"`
-}
-
-// printDevicesJSON печатает устройства LAN.
-func (c *Capture) printDevicesJSON() {
-	if !c.routerMode {
-		return
-	}
-
-	devices := c.flows.BuildDevices()
-	for _, d := range devices {
-		ev := DeviceEvent{
-			Event:     newEvent("device"),
-			Cycle:     c.printCycle,
-			IP:        d.IP,
-			MAC:       d.MAC,
-			Vendor:    d.Vendor,
-			Hostname:  d.Hostname,
-			Conns:     d.Conns,
-			Domains:   d.Domains,
-			BytesOut:  d.BytesOut,
-			BytesIn:   d.BytesIn,
-			FirstSeen: d.FirstSeen.UTC().Format(time.RFC3339Nano),
-			LastSeen:  d.LastSeen.UTC().Format(time.RFC3339Nano),
-		}
-		printJSON(ev)
-	}
-}
-
-// printHealthJSON печатает Capture Health.
-func (c *Capture) printHealthJSON() {
-	c.stats.mu.Lock()
-	s := c.stats
-	c.stats.mu.Unlock()
-
-	quality := "complete"
-	if s.PacketsTruncated > 0 || s.DecodeErrors > 0 {
-		quality = "incomplete"
-	}
-
-	ev := HealthEvent{
-		Event:            newEvent("health"),
-		Cycle:            c.printCycle,
-		Iface:            c.iface,
-		Filter:           c.filter,
-		Snaplen:          c.snaplen,
-		UptimeSec:        int64(time.Since(s.StartedAt).Seconds()),
-		PacketsReceived:  s.PacketsReceived,
-		PacketsProcessed: s.PacketsProcessed,
-		PacketsTruncated: s.PacketsTruncated,
-		DecodeErrors:     s.DecodeErrors,
-		NoIPLayer:        s.NoIPLayer,
-		BytesReceived:    s.BytesReceived,
-		BytesProcessed:   s.BytesProcessed,
-		Quality:          quality,
-	}
-	printJSON(ev)
-}
-
-// printAllJSON — общая точка входа для JSON-режима.
-func (c *Capture) printAllJSON() {
-	c.printCycle++
-	c.printSnapshotJSON()
-	c.printHealthJSON()
-	c.printFlowsJSON()
-	c.printDNSJSON()
-	c.printAttributionJSON()
-	c.printProxySuspicionsJSON()
-	c.printProxyProcessesJSON()
-	c.printAnomaliesJSON()
-	c.printDNSObservationsJSON()
-	c.printDeviceGroupsJSON()
-	c.printDevicesJSON()
-	c.checkDirectOutbound()
-	c.printPolicyViolationsJSON()
-}
-
-// looksLikeSNI — простая проверка, похоже ли значение на домен, а не на IP.
-func looksLikeSNI(s string) bool {
-	if s == "" {
-		return false
-	}
-	// IPv4
-	if net.ParseIP(s) != nil {
-		return false
-	}
-	// Домен должен содержать точку
-	return strings.Contains(s, ".")
-}
-
 // printFlowsJSON печатает агрегированные потоки.
-func (c *Capture) printFlowsJSON() {
-	flows := c.flows.Aggregate()
+// Настоящие SNI/hostname берутся из полей AggregatedFlow (см. дельту
+// flow_table.go) — раньше SNI «угадывали» по Label и путали с hostname
+// и суффиксами реконструкции.
+func (c *Capture) printFlowsJSON(flows []FlowStats) {
+	groups := c.flows.aggregateFrom(flows)
 
-	c.stats.mu.Lock()
-	incomplete := c.stats.PacketsTruncated > 0 || c.stats.DecodeErrors > 0
-	c.stats.mu.Unlock()
-
+	s := c.statsSnapshot()
+	incomplete := s.PacketsTruncated > 0 || s.DecodeErrors > 0
 	now := time.Now()
 
-	for _, g := range flows {
-		// Определяем настоящий SNI: в AggregatedFlow.Label лежит SNI/hostname/IP
-		// Если это IP или hostname, SNI пустой
-		sni := ""
-		label := g.Label
-
-		if looksLikeSNI(g.Label) {
-			sni = g.Label
-		}
-
-		ev := FlowEvent{
+	for _, g := range groups {
+		printJSON(FlowEvent{
 			Event:             newEvent("flow"),
 			Cycle:             c.printCycle,
-			Label:             label,
+			Label:             stripReconNote(g.Label),
 			Process:           g.Process,
-			SNI:               sni,
+			SNI:               g.SNI,
+			Hostname:          g.Hostname,
 			Classification:    g.Class.String(),
 			Proto:             g.Proto,
 			Recon:             g.Recon.String(),
@@ -366,8 +266,8 @@ func (c *Capture) printFlowsJSON() {
 			Retransmits:       g.Retransmits,
 			Gaps:              g.Gaps,
 			AgeSec:            int64(now.Sub(g.FirstSeen).Seconds()),
-			FirstSeen:         g.FirstSeen.UTC().Format(time.RFC3339Nano),
-			LastSeen:          g.LastSeen.UTC().Format(time.RFC3339Nano),
+			FirstSeen:         fmtTime(g.FirstSeen),
+			LastSeen:          fmtTime(g.LastSeen),
 			CaptureIncomplete: incomplete,
 			RouteInterface:    g.Route.Interface,
 			RouteSrcIP:        g.Route.SrcIP,
@@ -376,10 +276,11 @@ func (c *Capture) printFlowsJSON() {
 			ECH:               g.ECH,
 			JA3:               g.JA3,
 			JA4:               g.JA4,
-		}
-		printJSON(ev)
+		})
 	}
 }
+
+// --- DNS ---
 
 // DNSEvent — один DNS-запрос.
 type DNSEvent struct {
@@ -397,65 +298,25 @@ type DNSEvent struct {
 	Flags     string `json:"flags,omitempty"`
 }
 
-// DeviceGroupEvent — агрегат по устройству/приложению.
-type DeviceGroupEvent struct {
-	Event
-
-	Cycle    int    `json:"cycle"`
-	GroupBy  string `json:"group_by"` // "app" | "device"
-	Process  string `json:"process"`  // для app-режима
-	Display  string `json:"display"`
-	IP       string `json:"ip,omitempty"`
-	MAC      string `json:"mac,omitempty"`
-	Vendor   string `json:"vendor,omitempty"`
-	Hostname string `json:"hostname,omitempty"`
-
-	Conns      int      `json:"conns"`
-	Domains    int      `json:"domains"`
-	TopDomains []string `json:"top_domains,omitempty"`
-
-	Direct  int `json:"direct"`
-	Proxy   int `json:"proxy"`
-	VPN     int `json:"vpn"`
-	Unknown int `json:"unknown"`
-
-	BytesOut  uint64 `json:"bytes_out"`
-	BytesIn   uint64 `json:"bytes_in"`
-	FirstSeen string `json:"first_seen"`
-	LastSeen  string `json:"last_seen"`
-}
-
-// printDeviceGroupsJSON печатает агрегаты по устройству/приложению.
-func (c *Capture) printDeviceGroupsJSON() {
-	if c.groupBy != "app" && c.groupBy != "device" {
-		return
-	}
-
-	groups := c.flows.AggregateByApp()
-	for _, g := range groups {
-		ev := DeviceGroupEvent{
-			Event:      newEvent("device_group"),
-			Cycle:      c.printCycle,
-			GroupBy:    c.groupBy,
-			Process:    g.Process,
-			Display:    g.Display,
-			IP:         g.IP,
-			MAC:        g.MAC,
-			Vendor:     g.Vendor,
-			Hostname:   g.Hostname,
-			Conns:      g.Connections,
-			Domains:    g.Domains,
-			TopDomains: g.TopDomains,
-			Direct:     g.Direct,
-			Proxy:      g.Proxy,
-			VPN:        g.VPN,
-			Unknown:    g.Unknown,
-			BytesOut:   g.BytesOut,
-			BytesIn:    g.BytesIn,
-			FirstSeen:  g.FirstSeen.UTC().Format(time.RFC3339Nano),
-			LastSeen:   g.LastSeen.UTC().Format(time.RFC3339Nano),
+// printDNSJSON печатает DNS-запросы.
+func (c *Capture) printDNSJSON() {
+	for _, q := range c.dnsTable.Snapshot() {
+		if !c.showPTR && isReverseDNSName(q.Name) {
+			continue
 		}
-		printJSON(ev)
+		printJSON(DNSEvent{
+			Event:     newEvent("dns"),
+			Cycle:     c.printCycle,
+			Name:      q.Name,
+			QType:     q.QType,
+			SrcIP:     q.SrcIP,
+			DstIP:     q.DstIP,
+			Transport: q.Transport,
+			Count:     q.Count,
+			FirstSeen: fmtTime(q.FirstSeen),
+			LastSeen:  fmtTime(q.LastSeen),
+			Flags:     q.Flags,
+		})
 	}
 }
 
@@ -478,55 +339,30 @@ type DNSObservationEvent struct {
 func (c *Capture) printDNSObservationsJSON() {
 	var obs []DNSObservation
 	if c.dnsAge > 0 {
-		cutoff := time.Now().Add(-c.dnsAge)
-		obs = c.dnsMapping.SnapshotObservationsSince(cutoff)
+		obs = c.dnsMapping.SnapshotObservationsSince(time.Now().Add(-c.dnsAge))
 	} else {
 		obs = c.dnsMapping.SnapshotObservations()
 	}
 
 	for _, o := range obs {
 		for _, ip := range o.Answers {
-			ev := DNSObservationEvent{
+			printJSON(DNSObservationEvent{
 				Event:      newEvent("dns_observation"),
 				Cycle:      c.printCycle,
 				QName:      o.QName,
 				IP:         ip,
 				TTL:        o.TTL,
-				ObservedAt: o.ObservedAt.UTC().Format(time.RFC3339Nano),
-				ExpiresAt:  o.ExpiresAt.UTC().Format(time.RFC3339Nano),
+				ObservedAt: fmtTime(o.ObservedAt),
+				ExpiresAt:  fmtTime(o.ExpiresAt),
 				ClientIP:   o.ClientIP,
 				ResolverIP: o.ResolverIP,
 				Transport:  o.Transport,
-			}
-			printJSON(ev)
+			})
 		}
 	}
 }
 
-// printDNSJSON печатает DNS-запросы.
-func (c *Capture) printDNSJSON() {
-	queries := c.dnsTable.Snapshot()
-	for _, q := range queries {
-		// Пропускаем PTR, если showPTR = false
-		if !c.showPTR && strings.HasSuffix(q.Name, ".in-addr.arpa") {
-			continue
-		}
-		ev := DNSEvent{
-			Event:     newEvent("dns"),
-			Cycle:     c.printCycle,
-			Name:      q.Name,
-			QType:     q.QType,
-			SrcIP:     q.SrcIP,
-			DstIP:     q.DstIP,
-			Transport: q.Transport,
-			Count:     q.Count,
-			FirstSeen: q.FirstSeen.UTC().Format(time.RFC3339Nano),
-			LastSeen:  q.LastSeen.UTC().Format(time.RFC3339Nano),
-			Flags:     q.Flags,
-		}
-		printJSON(ev)
-	}
-}
+// --- Атрибуция ---
 
 // AttributionEvent — одна связка DNS ↔ SNI ↔ IP.
 type AttributionEvent struct {
@@ -538,38 +374,27 @@ type AttributionEvent struct {
 	RemotePort uint16   `json:"remote_port"`
 	SNI        string   `json:"sni,omitempty"`
 	DNSNames   []string `json:"dns_names,omitempty"`
-	Status     string   `json:"status"` // "✓", "~", "?", "✗", "⚠"
+	Status     string   `json:"status"` // matched | mismatch | dns_only | sni_only | unknown
 	Reason     string   `json:"reason,omitempty"`
 	AgeSec     int64    `json:"age_sec"`
 }
 
 // printAttributionJSON печатает связки DNS ↔ SNI ↔ IP.
-func (c *Capture) printAttributionJSON() {
-	attrs := BuildAttributions(c.flows.Snapshot(), c.dnsMapping)
-	for _, a := range attrs {
-		// Определяем статус и причину
-		status := "?"
-		reason := ""
-
+func (c *Capture) printAttributionJSON(flows []FlowStats) {
+	for _, a := range BuildAttributions(flows, c.dnsMapping) {
+		status, reason := "unknown", "no sni, no dns"
 		switch {
 		case a.Matched:
-			status = "✓"
-			reason = "sni matches dns"
+			status, reason = "matched", "sni matches dns"
 		case a.Mismatch:
-			status = "⚠"
-			reason = "sni != dns"
+			status, reason = "mismatch", "sni != dns"
 		case len(a.DNSNames) > 0:
-			status = "~"
-			reason = "dns only, no sni"
+			status, reason = "dns_only", "dns only, no sni"
 		case a.SNI != "":
-			status = "✗"
-			reason = "sni only, no dns"
-		default:
-			status = "?"
-			reason = "no sni, no dns"
+			status, reason = "sni_only", "sni only, no dns"
 		}
 
-		ev := AttributionEvent{
+		printJSON(AttributionEvent{
 			Event:      newEvent("attribution"),
 			Cycle:      c.printCycle,
 			Local:      fmt.Sprintf("%s:%d", a.LocalIP, a.LocalPort),
@@ -580,10 +405,11 @@ func (c *Capture) printAttributionJSON() {
 			Status:     status,
 			Reason:     reason,
 			AgeSec:     int64(a.Age.Seconds()),
-		}
-		printJSON(ev)
+		})
 	}
 }
+
+// --- Прокси ---
 
 // ProxySuspicionEvent — поток, похожий на прокси.
 type ProxySuspicionEvent struct {
@@ -595,23 +421,25 @@ type ProxySuspicionEvent struct {
 	SNI        string `json:"sni,omitempty"`
 	Process    string `json:"process,omitempty"`
 	Reason     string `json:"reason"`
+	ReasonCode string `json:"reason_code,omitempty"` // машинный код причины
 	Confidence string `json:"confidence"`
 	AgeSec     int64  `json:"age_sec"`
 }
 
 // printProxySuspicionsJSON печатает подозрения на прокси.
-func (c *Capture) printProxySuspicionsJSON() {
-	sus := BuildProxySuspicions(c.flows.Snapshot(), c.dnsMapping)
-	for _, s := range sus {
+// Confidence берётся из машинного кода причины (ReasonCode, см. дельту
+// attribution.go) — раньше определялся парсингом русских строк вывода.
+func (c *Capture) printProxySuspicionsJSON(flows []FlowStats) {
+	for _, s := range BuildProxySuspicions(flows, c.dnsMapping) {
 		conf := "heuristic"
-		switch {
-		case strings.Contains(s.Reason, "процесс-прокси"):
+		switch s.ReasonCode {
+		case "process":
 			conf = "process"
-		case strings.Contains(s.Reason, "прокси-фронт"):
+		case "sni-not-resolved":
 			conf = "dns-mismatch"
 		}
 
-		ev := ProxySuspicionEvent{
+		printJSON(ProxySuspicionEvent{
 			Event:      newEvent("proxy_suspicion"),
 			Cycle:      c.printCycle,
 			Local:      fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort),
@@ -619,10 +447,10 @@ func (c *Capture) printProxySuspicionsJSON() {
 			SNI:        s.SNI,
 			Process:    s.Process,
 			Reason:     s.Reason,
+			ReasonCode: s.ReasonCode,
 			Confidence: conf,
 			AgeSec:     int64(s.Age.Seconds()),
-		}
-		printJSON(ev)
+		})
 	}
 }
 
@@ -639,12 +467,10 @@ type ProxyProcessEvent struct {
 	AgeSec    int64  `json:"age_sec"`
 }
 
-// printProxyProcessesJSON печатает агрегат по процессам-прокси.
-func (c *Capture) printProxyProcessesJSON() {
-	procs := BuildProxyProcesses(c.flows.Snapshot())
+func (c *Capture) printProxyProcessesJSON(flows []FlowStats) {
 	now := time.Now()
-	for _, p := range procs {
-		ev := ProxyProcessEvent{
+	for _, p := range BuildProxyProcesses(flows) {
+		printJSON(ProxyProcessEvent{
 			Event:     newEvent("proxy_process"),
 			Cycle:     c.printCycle,
 			Process:   p.Process,
@@ -653,34 +479,138 @@ func (c *Capture) printProxyProcessesJSON() {
 			BytesIn:   p.BytesIn,
 			RemoteIPs: p.RemoteIPs,
 			AgeSec:    int64(now.Sub(p.FirstSeen).Seconds()),
-		}
-		printJSON(ev)
+		})
 	}
 }
 
-// AnomalyEvent — аномалия (⚡NEW, ⚠HASH, ⚠BEACON, ⚠PROXY, ⚠DNS-LEAK).
+// --- Приложения / устройства ---
+
+// DeviceGroupEvent — агрегат по устройству/приложению.
+type DeviceGroupEvent struct {
+	Event
+
+	Cycle    int    `json:"cycle"`
+	GroupBy  string `json:"group_by"` // "app" | "device"
+	Process  string `json:"process"`
+	Display  string `json:"display"`
+	IP       string `json:"ip,omitempty"`
+	MAC      string `json:"mac,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+
+	Conns      int      `json:"conns"`
+	Domains    int      `json:"domains"`
+	TopDomains []string `json:"top_domains,omitempty"`
+
+	Direct  int `json:"direct"`
+	Proxy   int `json:"proxy"`
+	VPN     int `json:"vpn"`
+	Unknown int `json:"unknown"`
+
+	BytesOut  uint64 `json:"bytes_out"`
+	BytesIn   uint64 `json:"bytes_in"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+}
+
+// printDeviceGroupsJSON печатает агрегаты по устройству/приложению.
+func (c *Capture) printDeviceGroupsJSON(flows []FlowStats) {
+	if c.groupBy != "app" && c.groupBy != "device" {
+		return
+	}
+
+	for _, g := range c.flows.aggregateByAppFrom(flows) {
+		printJSON(DeviceGroupEvent{
+			Event:      newEvent("device_group"),
+			Cycle:      c.printCycle,
+			GroupBy:    c.groupBy,
+			Process:    g.Process,
+			Display:    g.Display,
+			IP:         g.IP,
+			MAC:        g.MAC,
+			Vendor:     g.Vendor,
+			Hostname:   g.Hostname,
+			Conns:      g.Connections,
+			Domains:    g.Domains,
+			TopDomains: g.TopDomains,
+			Direct:     g.Direct,
+			Proxy:      g.Proxy,
+			VPN:        g.VPN,
+			Unknown:    g.Unknown,
+			BytesOut:   g.BytesOut,
+			BytesIn:    g.BytesIn,
+			FirstSeen:  fmtTime(g.FirstSeen),
+			LastSeen:   fmtTime(g.LastSeen),
+		})
+	}
+}
+
+// DeviceEvent — событие об устройстве LAN.
+type DeviceEvent struct {
+	Event
+	Cycle     int    `json:"cycle"`
+	IP        string `json:"ip"`
+	MAC       string `json:"mac,omitempty"`
+	Vendor    string `json:"vendor,omitempty"`
+	Hostname  string `json:"hostname,omitempty"`
+	Conns     int    `json:"conns"`
+	Domains   int    `json:"domains"`
+	BytesOut  uint64 `json:"bytes_out"`
+	BytesIn   uint64 `json:"bytes_in"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+}
+
+// printDevicesJSON печатает устройства LAN.
+func (c *Capture) printDevicesJSON(flows []FlowStats) {
+	if !c.routerMode {
+		return
+	}
+
+	for _, d := range c.flows.buildDevicesFrom(flows) {
+		printJSON(DeviceEvent{
+			Event:     newEvent("device"),
+			Cycle:     c.printCycle,
+			IP:        d.IP,
+			MAC:       d.MAC,
+			Vendor:    d.Vendor,
+			Hostname:  d.Hostname,
+			Conns:     d.Conns,
+			Domains:   d.Domains,
+			BytesOut:  d.BytesOut,
+			BytesIn:   d.BytesIn,
+			FirstSeen: fmtTime(d.FirstSeen),
+			LastSeen:  fmtTime(d.LastSeen),
+		})
+	}
+}
+
+// --- Аномалии ---
+
+// AnomalyEvent — аномалия (NEW, HASH, BEACON, PROXY, DNS-LEAK).
 type AnomalyEvent struct {
 	Event
 
 	Cycle   int    `json:"cycle"`
-	Kind    string `json:"kind"` // NEW, HASH, BEACON, PROXY, DNS-LEAK
+	Kind    string `json:"kind"`
 	Domain  string `json:"domain,omitempty"`
 	Detail  string `json:"detail,omitempty"`
 	Process string `json:"process,omitempty"`
 	AgeSec  int64  `json:"age_sec"`
 }
 
-// printAnomaliesJSON печатает аномалии.
+// printAnomaliesJSON печатает аномалии за окно anomalyWindow.
+// ВНИМАНИЕ: сейчас это «состояние» — каждая аномалия повторяется
+// каждый цикл, пока живёт в окне (~60 раз за 5 минут). Если потребитель
+// ждёт события — нужен emit-once (флаг emittedJSON в детекторе).
 func (c *Capture) printAnomaliesJSON() {
 	if c.anomaly == nil {
 		return
 	}
 
-	records := c.anomaly.CollectAnomalies(5 * time.Minute)
 	now := time.Now()
-
-	for _, a := range records {
-		ev := AnomalyEvent{
+	for _, a := range c.anomaly.CollectAnomalies(anomalyWindow) {
+		printJSON(AnomalyEvent{
 			Event:   newEvent("anomaly"),
 			Cycle:   c.printCycle,
 			Kind:    a.Kind,
@@ -688,7 +618,45 @@ func (c *Capture) printAnomaliesJSON() {
 			Detail:  a.Detail,
 			Process: a.Process,
 			AgeSec:  int64(now.Sub(a.Time).Seconds()),
+		})
+	}
+}
+
+// --- Policy ---
+
+// PolicyViolationEvent — нарушение политики.
+type PolicyViolationEvent struct {
+	Event
+	Cycle    int    `json:"cycle"`
+	Rule     string `json:"rule"`
+	Expected string `json:"expected"`
+	Actual   string `json:"actual"`
+	Detail   string `json:"detail"`
+}
+
+// printPolicyViolationsJSON печатает нарушения — каждое ОДИН раз
+// (раньше весь накопленный список повторялся в каждом цикле).
+func (c *Capture) printPolicyViolationsJSON() {
+	c.violationsMu.Lock()
+	defer c.violationsMu.Unlock()
+
+	for _, v := range c.violations {
+		key := v.Rule + "\x00" + v.Actual
+		if c.violationsEmitted == nil {
+			c.violationsEmitted = make(map[string]bool)
 		}
-		printJSON(ev)
+		if c.violationsEmitted[key] {
+			continue
+		}
+		c.violationsEmitted[key] = true
+
+		printJSON(PolicyViolationEvent{
+			Event:    newEvent("policy_violation"),
+			Cycle:    c.printCycle,
+			Rule:     v.Rule,
+			Expected: v.Expected,
+			Actual:   v.Actual,
+			Detail:   v.Detail,
+		})
 	}
 }

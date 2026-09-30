@@ -4,11 +4,27 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// --- Константы ---
+
+const (
+	dnsTableMaxAge  = 5 * time.Minute  // окно показа запросов (DNSTable)
+	dnsMapMaxAge    = 2 * time.Minute  // окно актуальности связок (DNSMapping)
+	dnsFallbackTTL  = 10 * time.Minute // TTL=0 → считаем столько
+	obsPerPairMax   = 16               // записей истории на пару (name, IP)
+	obsHistoryDepth = 1 * time.Hour    // глубина истории наблюдений
+
+	retryWindow      = time.Second // ретраи внутри окна не считаем отдельно
+	dnsSweepInterval = time.Minute // период уборки (DNSMapping)
+)
+
+// --- DNSTable ---
 
 // DNSQuery — одна наблюдённая DNS-запись.
 type DNSQuery struct {
@@ -20,8 +36,9 @@ type DNSQuery struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Count     uint64
-	Flags     string // метка аномалии
-	// Для дедупликации retry'ев
+	Flags     string // метки аномалий
+
+	// Дедупликация ретраев.
 	lastCounted time.Time
 }
 
@@ -36,24 +53,7 @@ type DNSTable struct {
 func NewDNSTable() *DNSTable {
 	return &DNSTable{
 		queries: make(map[string]*DNSQuery),
-		maxAge:  5 * time.Minute,
-		showPTR: false,
-	}
-}
-
-// SetFlags устанавливает метку аномалии для запроса.
-func (dt *DNSTable) SetFlags(name, qtype, srcIP, dstIP, flags string) {
-	key := name + "|" + qtype + "|" + srcIP + "|" + dstIP + "|udp/53"
-
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-
-	if q, ok := dt.queries[key]; ok {
-		if q.Flags == "" {
-			q.Flags = flags
-		} else if !strings.Contains(q.Flags, flags) {
-			q.Flags += " " + flags
-		}
+		maxAge:  dnsTableMaxAge,
 	}
 }
 
@@ -73,26 +73,19 @@ func (dt *DNSTable) SetShowPTR(v bool) {
 
 // Update разбирает payload и, если это DNS-запрос, добавляет в таблицу.
 func (dt *DNSTable) Update(payload []byte, srcIP, dstIP string, srcPort, dstPort uint16, proto string) {
-	name, qtype, ok := parseDNSQuery(payload)
+	msg := dnsMessage(payload, proto)
+	if msg == nil {
+		return
+	}
+
+	name, qtype, ok := parseDNSQuery(msg)
 	if !ok {
 		return
 	}
 
-	transport := proto
-	switch {
-	case proto == "UDP" && srcPort == 5353:
-		transport = "mdns"
-	case proto == "UDP" && dstPort == 5353:
-		transport = "mdns"
-	case proto == "UDP" && dstPort == 53:
-		transport = "udp/53"
-	case proto == "UDP":
-		transport = fmt.Sprintf("udp/%d", dstPort)
-	case proto == "TCP" && dstPort == 53:
-		transport = "tcp/53"
-	}
-
+	transport := dnsTransport(proto, srcPort, dstPort)
 	key := name + "|" + qtype + "|" + srcIP + "|" + dstIP + "|" + transport
+	now := time.Now()
 
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
@@ -105,33 +98,63 @@ func (dt *DNSTable) Update(payload []byte, srcIP, dstIP string, srcPort, dstPort
 			SrcIP:     srcIP,
 			DstIP:     dstIP,
 			Transport: transport,
-			FirstSeen: time.Now(),
+			FirstSeen: now,
 		}
 		dt.queries[key] = q
 	}
-	now := time.Now()
 
-	// Дедупликация: если тот же запрос пришёл < 1 сек назад — это retry, не считаем
-	if q.lastCounted.IsZero() || now.Sub(q.lastCounted) >= time.Second {
+	// Ретраи того же запроса в течение retryWindow не считаем.
+	if q.lastCounted.IsZero() || now.Sub(q.lastCounted) >= retryWindow {
 		q.Count++
 		q.lastCounted = now
 	}
-
 	q.LastSeen = now
 }
 
-// Snapshot возвращает копию записей, отсортированную по LastSeen.
+// SetFlags устанавливает метку аномалии для запроса.
+// Транспорт в ключе НЕ участвует: раньше ключ был захардкожен с "udp/53",
+// и метки терялись для mDNS и TCP/53.
+func (dt *DNSTable) SetFlags(name, qtype, srcIP, dstIP, flags string) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	for _, q := range dt.queries {
+		if q.Name != name || q.QType != qtype || q.SrcIP != srcIP || q.DstIP != dstIP {
+			continue
+		}
+		if q.Flags == "" {
+			q.Flags = flags
+			continue
+		}
+		// Точное совпадение токена: substring-проверка ловила
+		// "⚠POLICY-DNS→8.8.8.8" внутри "...→8.8.8.81".
+		if !slices.Contains(strings.Fields(q.Flags), flags) {
+			q.Flags += " " + flags
+		}
+	}
+}
+
+// Snapshot возвращает копию записей, свежие сверху.
+// Попутно чистит записи старше окна показа: без этого таблица
+// растёт бесконечно (метки приходят сразу после запроса, запаздывания нет).
 func (dt *DNSTable) Snapshot() []DNSQuery {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
+
+	if dt.maxAge > 0 {
+		cutoff := time.Now().Add(-dt.maxAge).Add(-time.Minute) // запас для SetFlags
+		for key, q := range dt.queries {
+			if q.LastSeen.Before(cutoff) {
+				delete(dt.queries, key)
+			}
+		}
+	}
 
 	out := make([]DNSQuery, 0, len(dt.queries))
 	for _, q := range dt.queries {
 		out = append(out, *q)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeen.After(out[j].LastSeen)
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
 	return out
 }
 
@@ -145,49 +168,40 @@ func (dt *DNSTable) Len() int {
 // Print выводит таблицу DNS-запросов.
 func (dt *DNSTable) Print() {
 	all := dt.Snapshot()
-	if len(all) == 0 {
-		return
-	}
 
 	dt.mu.Lock()
 	maxAge := dt.maxAge
 	showPTR := dt.showPTR
 	dt.mu.Unlock()
 
-	// Фильтр по свежести и PTR
-	queries := make([]DNSQuery, 0, len(all))
+	// Фильтр по свежести и PTR.
 	cutoff := time.Now().Add(-maxAge)
+	queries := make([]DNSQuery, 0, len(all))
 	for _, q := range all {
 		if maxAge > 0 && !q.LastSeen.After(cutoff) {
 			continue
 		}
-		if !showPTR && strings.HasSuffix(q.Name, ".in-addr.arpa") {
+		if !showPTR && isReverseDNSName(q.Name) {
 			continue
 		}
 		queries = append(queries, q)
 	}
-
 	if len(queries) == 0 {
 		return
 	}
 
-	// Собираем уникальные DNS-серверы, к которым обращались
-	dnsServers := make(map[string]int)
-	for _, q := range queries {
-		dnsServers[q.DstIP]++
-	}
-
 	fmt.Printf("\n=== DNS-запросы (%d) ===\n", len(queries))
 
-	// Если запросов к внешним DNS много — предупреждаем
-	externalCount := 0
-	for ip, count := range dnsServers {
-		if !isPrivateIP(ip) {
-			externalCount += count
+	// Запросы к внешним резолверам. mDNS — multicast (224.0.0.251 / ff02::fb),
+	// он не «внешний DNS», хотя IP не приватный.
+	external := 0
+	for _, q := range queries {
+		if q.Transport != "mdns" && !isPrivateIP(q.DstIP) {
+			external++
 		}
 	}
-	if externalCount > 0 {
-		fmt.Printf("⚠  обнаружены запросы к внешним DNS: %d\n", externalCount)
+	if external > 0 {
+		fmt.Printf("⚠  обнаружены запросы к внешним DNS: %d\n", external)
 	}
 
 	fmt.Printf("%-18s %-40s %-6s %-8s %-16s %5s %-5s %s\n",
@@ -200,7 +214,7 @@ func (dt *DNSTable) Print() {
 			truncate(q.Name, 40),
 			q.QType,
 			q.Transport,
-			q.DstIP,
+			truncate(q.DstIP, 16),
 			q.Count,
 			age.String(),
 			q.Flags)
@@ -208,58 +222,190 @@ func (dt *DNSTable) Print() {
 	fmt.Println()
 }
 
-// parseDNSQuery разбирает DNS-запрос из payload.
-// Возвращает (qname, qtype, true) если это запрос.
-func parseDNSQuery(payload []byte) (string, string, bool) {
-	// Минимум: 12 байт заголовка + вопрос
-	if len(payload) < 13 {
-		return "", "", false
-	}
+// --- Разбор DNS ---
 
-	// Flags: QR bit (bit 15) = 0 для запроса, 1 для ответа
-	flags := binary.BigEndian.Uint16(payload[2:4])
-	if flags&0x8000 != 0 {
-		return "", "", false // это ответ, не запрос
+// dnsMessage извлекает DNS-сообщение из payload пакета.
+// DNS-over-TCP предваряет сообщение двухбайтовой длиной — раньше её
+// не снимали, и TCP/53 парсился мимо (заголовок читался со смещением).
+func dnsMessage(payload []byte, proto string) []byte {
+	if len(payload) < 12 {
+		return nil
 	}
-
-	// QDCOUNT должен быть 1
-	qdcount := binary.BigEndian.Uint16(payload[4:6])
-	if qdcount != 1 {
-		return "", "", false
+	if proto != protoTCP {
+		return payload
 	}
+	if len(payload) < 14 {
+		return nil
+	}
+	// Длина должна совпадать: продолжения сегментов и мусор отбрасываем —
+	// парсинг всё равно не прошёл бы.
+	if n := binary.BigEndian.Uint16(payload[:2]); int(n) != len(payload)-2 {
+		return nil
+	}
+	return payload[2:]
+}
 
-	// Парсим QNAME начиная с offset 12
-	pos := 12
-	var name strings.Builder
-	for pos < len(payload) {
-		labelLen := int(payload[pos])
-		if labelLen == 0 {
-			pos++
-			break
+// dnsTransport — человекочитаемый транспорт DNS-пакета.
+func dnsTransport(proto string, srcPort, dstPort uint16) string {
+	switch proto {
+	case protoTCP:
+		return "tcp/53" // DNS-over-TCP — только 53
+	case protoUDP:
+		switch {
+		case srcPort == portMDNS || dstPort == portMDNS:
+			return "mdns"
+		case dstPort == portDNS:
+			return "udp/53"
+		default:
+			return fmt.Sprintf("udp/%d", dstPort)
 		}
-		// Компрессия не должна быть в запросе (только в ответе)
-		if labelLen&0xC0 != 0 {
-			return "", "", false
+	default:
+		return proto
+	}
+}
+
+// readName читает доменное имя с позиции pos.
+// Указатель компрессии завершает имя (не разворачиваем — для наших
+// задач достаточно). Возвращает имя, новую позицию и признак успеха.
+func readName(msg []byte, pos int) (string, int, bool) {
+	if pos >= len(msg) {
+		return "", 0, false
+	}
+	var b strings.Builder
+	for pos < len(msg) {
+		l := int(msg[pos])
+		switch {
+		case l == 0: // конец имени
+			return b.String(), pos + 1, true
+		case l&0xC0 == 0xC0: // указатель компрессии
+			if pos+2 > len(msg) {
+				return "", 0, false
+			}
+			return b.String(), pos + 2, true
+		case l&0xC0 != 0: // зарезервированные биты — мусор
+			return "", 0, false
 		}
 		pos++
-		if pos+labelLen > len(payload) {
-			return "", "", false
+		if pos+l > len(msg) {
+			return "", 0, false
 		}
-		if name.Len() > 0 {
-			name.WriteByte('.')
+		if b.Len() > 0 {
+			b.WriteByte('.')
 		}
-		name.Write(payload[pos : pos+labelLen])
-		pos += labelLen
+		b.Write(msg[pos : pos+l])
+		pos += l
 	}
+	return "", 0, false
+}
 
-	// QTYPE
-	if pos+2 > len(payload) {
+// skipName пропускает доменное имя (секция ответов: имя не нужно).
+// Возвращает новую позицию или -1. Прежний код после компрессии
+// в середине имени съедал лишний байт и читал TYPE со смещением.
+func skipName(msg []byte, pos int) int {
+	for pos < len(msg) {
+		l := int(msg[pos])
+		switch {
+		case l == 0:
+			return pos + 1
+		case l&0xC0 == 0xC0:
+			if pos+2 > len(msg) {
+				return -1
+			}
+			return pos + 2
+		case l&0xC0 != 0:
+			return -1
+		}
+		pos += 1 + l
+	}
+	return -1
+}
+
+// parseDNSQuery разбирает DNS-запрос: (qname, qtype, true).
+func parseDNSQuery(msg []byte) (string, string, bool) {
+	if len(msg) < 12 {
 		return "", "", false
 	}
-	qtype := binary.BigEndian.Uint16(payload[pos : pos+2])
+	// QR=0 — запрос; QDCOUNT=1.
+	if flags := binary.BigEndian.Uint16(msg[2:4]); flags&0x8000 != 0 {
+		return "", "", false
+	}
+	if binary.BigEndian.Uint16(msg[4:6]) != 1 {
+		return "", "", false
+	}
 
-	qtypeStr := dnsTypeString(qtype)
-	return name.String(), qtypeStr, true
+	name, pos, ok := readName(msg, 12)
+	if !ok || pos+2 > len(msg) {
+		return "", "", false
+	}
+	return name, dnsTypeString(binary.BigEndian.Uint16(msg[pos : pos+2])), true
+}
+
+// parseDNSResponse разбирает DNS-ответ: записи A/AAAA + минимальный TTL.
+// Возвращает (qname, IP, minTTL, ok). Прежние parseDNSResponse и
+// parseDNSResponseTTL были копипастой и парсили каждый ответ дважды.
+func parseDNSResponse(msg []byte) (string, []string, uint32, bool) {
+	if len(msg) < 12 {
+		return "", nil, 0, false
+	}
+	if flags := binary.BigEndian.Uint16(msg[2:4]); flags&0x8000 == 0 {
+		return "", nil, 0, false // это запрос
+	}
+	qdcount := binary.BigEndian.Uint16(msg[4:6])
+	ancount := binary.BigEndian.Uint16(msg[6:8])
+	if qdcount == 0 || ancount == 0 {
+		return "", nil, 0, false
+	}
+
+	// Секция вопроса: QNAME + QTYPE(2) + QCLASS(2).
+	name, pos, ok := readName(msg, 12)
+	if !ok || name == "" {
+		return "", nil, 0, false
+	}
+	pos += 4
+
+	var ips []string
+	var minTTL uint32
+
+	for i := 0; i < int(ancount); i++ {
+		pos = skipName(msg, pos) // владелец записи — пропускаем
+		if pos < 0 {
+			break
+		}
+		// TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2).
+		if pos+10 > len(msg) {
+			break
+		}
+		rtype := binary.BigEndian.Uint16(msg[pos : pos+2])
+		ttl := binary.BigEndian.Uint32(msg[pos+4 : pos+8])
+		rdlength := int(binary.BigEndian.Uint16(msg[pos+8 : pos+10]))
+		pos += 10
+		if pos+rdlength > len(msg) {
+			break
+		}
+
+		switch rtype {
+		case 1: // A
+			if rdlength == 4 {
+				ips = append(ips, net.IP(msg[pos:pos+4]).String())
+				if minTTL == 0 || ttl < minTTL {
+					minTTL = ttl
+				}
+			}
+		case 28: // AAAA
+			if rdlength == 16 {
+				ips = append(ips, net.IP(msg[pos:pos+16]).String())
+				if minTTL == 0 || ttl < minTTL {
+					minTTL = ttl
+				}
+			}
+		}
+		pos += rdlength
+	}
+
+	if len(ips) == 0 {
+		return "", nil, 0, false
+	}
+	return name, ips, minTTL, true
 }
 
 // dnsTypeString возвращает человекочитаемое имя типа DNS-записи.
@@ -300,295 +446,33 @@ func dnsTypeString(t uint16) string {
 	}
 }
 
-// parseDNSResponse разбирает DNS-ответ и возвращает (qname, []IP, true).
-// Поддерживает записи A и AAAA.
-func parseDNSResponse(payload []byte) (string, []string, bool) {
-	if len(payload) < 12 {
-		return "", nil, false
-	}
-
-	flags := binary.BigEndian.Uint16(payload[2:4])
-	if flags&0x8000 == 0 {
-		return "", nil, false
-	}
-
-	qdcount := binary.BigEndian.Uint16(payload[4:6])
-	ancount := binary.BigEndian.Uint16(payload[6:8])
-	if qdcount == 0 || ancount == 0 {
-		return "", nil, false
-	}
-
-	pos := 12
-	var qname strings.Builder
-	for pos < len(payload) {
-		labelLen := int(payload[pos])
-		if labelLen == 0 {
-			pos++
-			break
-		}
-		if labelLen&0xC0 != 0 {
-			pos += 2
-			break
-		}
-		pos++
-		if pos+labelLen > len(payload) {
-			return "", nil, false
-		}
-		if qname.Len() > 0 {
-			qname.WriteByte('.')
-		}
-		qname.Write(payload[pos : pos+labelLen])
-		pos += labelLen
-	}
-
-	pos += 4
-
-	name := qname.String()
-	if name == "" {
-		return "", nil, false
-	}
-
-	var ips []string
-
-	for i := 0; i < int(ancount); i++ {
-		if pos >= len(payload) {
-			break
-		}
-		if payload[pos]&0xC0 == 0xC0 {
-			pos += 2
-		} else {
-			for pos < len(payload) && payload[pos] != 0 {
-				labelLen := int(payload[pos])
-				if labelLen&0xC0 != 0 {
-					pos += 2
-					break
-				}
-				pos += 1 + labelLen
-			}
-			pos++
-		}
-
-		if pos+10 > len(payload) {
-			break
-		}
-		rtype := binary.BigEndian.Uint16(payload[pos : pos+2])
-		rdlength := int(binary.BigEndian.Uint16(payload[pos+8 : pos+10]))
-		pos += 10
-
-		if pos+rdlength > len(payload) {
-			break
-		}
-
-		switch rtype {
-		case 1:
-			if rdlength == 4 {
-				ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
-					payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
-			}
-		case 28:
-			if rdlength == 16 {
-				ip := net.IP(payload[pos : pos+16])
-				ips = append(ips, ip.String())
-			}
-		}
-
-		pos += rdlength
-	}
-
-	if len(ips) == 0 {
-		return "", nil, false
-	}
-	return name, ips, true
+// isReverseDNSName: PTR-запросы (reverse-зона).
+func isReverseDNSName(name string) bool {
+	return strings.HasSuffix(name, ".in-addr.arpa") ||
+		strings.HasSuffix(name, ".ip6.arpa")
 }
 
-// parseDNSResponseTTL — как parseDNSResponse, но возвращает минимальный TTL.
-func parseDNSResponseTTL(payload []byte) (string, []string, uint32, bool) {
-	if len(payload) < 12 {
-		return "", nil, 0, false
-	}
-
-	flags := binary.BigEndian.Uint16(payload[2:4])
-	if flags&0x8000 == 0 {
-		return "", nil, 0, false
-	}
-
-	qdcount := binary.BigEndian.Uint16(payload[4:6])
-	ancount := binary.BigEndian.Uint16(payload[6:8])
-	if qdcount == 0 || ancount == 0 {
-		return "", nil, 0, false
-	}
-
-	pos := 12
-	var qname strings.Builder
-	for pos < len(payload) {
-		labelLen := int(payload[pos])
-		if labelLen == 0 {
-			pos++
-			break
-		}
-		if labelLen&0xC0 != 0 {
-			pos += 2
-			break
-		}
-		pos++
-		if pos+labelLen > len(payload) {
-			return "", nil, 0, false
-		}
-		if qname.Len() > 0 {
-			qname.WriteByte('.')
-		}
-		qname.Write(payload[pos : pos+labelLen])
-		pos += labelLen
-	}
-
-	pos += 4
-
-	name := qname.String()
-	if name == "" {
-		return "", nil, 0, false
-	}
-
-	var ips []string
-	var minTTL uint32
-
-	for i := 0; i < int(ancount); i++ {
-		if pos >= len(payload) {
-			break
-		}
-		if payload[pos]&0xC0 == 0xC0 {
-			pos += 2
-		} else {
-			for pos < len(payload) && payload[pos] != 0 {
-				labelLen := int(payload[pos])
-				if labelLen&0xC0 != 0 {
-					pos += 2
-					break
-				}
-				pos += 1 + labelLen
-			}
-			pos++
-		}
-
-		if pos+10 > len(payload) {
-			break
-		}
-		rtype := binary.BigEndian.Uint16(payload[pos : pos+2])
-		ttl := binary.BigEndian.Uint32(payload[pos+4 : pos+8])
-		rdlength := int(binary.BigEndian.Uint16(payload[pos+8 : pos+10]))
-		pos += 10
-
-		if pos+rdlength > len(payload) {
-			break
-		}
-
-		switch rtype {
-		case 1: // A
-			if rdlength == 4 {
-				ips = append(ips, fmt.Sprintf("%d.%d.%d.%d",
-					payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]))
-				if minTTL == 0 || ttl < minTTL {
-					minTTL = ttl
-				}
-			}
-		case 28: // AAAA
-			if rdlength == 16 {
-				ip := net.IP(payload[pos : pos+16])
-				ips = append(ips, ip.String())
-				if minTTL == 0 || ttl < minTTL {
-					minTTL = ttl
-				}
-			}
-		}
-
-		pos += rdlength
-	}
-
-	if len(ips) == 0 {
-		return "", nil, 0, false
-	}
-	return name, ips, minTTL, true
-}
-
-// isPrivateIP — грубая проверка, что IP из приватного диапазона.
+// isPrivateIP — приватный/локальный адрес.
+// Похоже на дубликат isLANIP из capture.go (и хуже: "::1" не loopback) —
+// оставлен как делегат; в итоге стоит оставить одно имя.
 func isPrivateIP(ip string) bool {
-	if strings.HasPrefix(ip, "10.") ||
-		strings.HasPrefix(ip, "192.168.") ||
-		strings.HasPrefix(ip, "127.") ||
-		strings.HasPrefix(ip, "169.254.") {
-		return true
-	}
-	// 172.16.0.0/12
-	if strings.HasPrefix(ip, "172.") {
-		parts := strings.Split(ip, ".")
-		if len(parts) == 4 {
-			// второй октет 16..31
-			switch parts[1] {
-			case "16", "17", "18", "19", "20", "21", "22", "23",
-				"24", "25", "26", "27", "28", "29", "30", "31":
-				return true
-			}
-		}
-	}
-	// IPv6 link-local
-	if strings.HasPrefix(ip, "fe80:") || strings.HasPrefix(ip, "fc") || strings.HasPrefix(ip, "fd") {
-		return true
-	}
-	return false
+	return isLANIP(ip)
 }
 
-// DNSMapping — хранилище связей name → IP и IP → name.
+// --- DNSMapping ---
+
+// DNSMapping — хранилище связей name ↔ IP. Две структуры:
+//   - nameToIPs/ipToNames — «текущий срез»: кто во что резолвится сейчас;
+//   - observations — история наблюдений с TTL: кто резолвился КОГДА.
 type DNSMapping struct {
 	mu        sync.RWMutex
-	nameToIPs map[string]map[string]time.Time // старое: name -> (IP -> lastSeen)
-	ipToNames map[string]map[string]time.Time // старое: IP -> (name -> lastSeen)
+	nameToIPs map[string]map[string]time.Time // name → IP → lastSeen
+	ipToNames map[string]map[string]time.Time // IP → name → lastSeen
 	maxAge    time.Duration
 
-	// новое: история наблюдений
 	observations map[string][]DNSObservation // key = name + "|" + ip
-}
 
-// SnapshotObservations возвращает все наблюдения DNS.
-func (m *DNSMapping) SnapshotObservations() []DNSObservation {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	out := make([]DNSObservation, 0)
-	seen := make(map[string]bool)
-	for _, list := range m.observations {
-		for _, o := range list {
-			// Дедуп по (qname, observed_at)
-			key := o.QName + "|" + o.ObservedAt.Format(time.RFC3339Nano)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			out = append(out, o)
-		}
-	}
-	return out
-}
-
-// SnapshotObservationsSince возвращает наблюдения, у которых ObservedAt >= cutoff.
-func (m *DNSMapping) SnapshotObservationsSince(cutoff time.Time) []DNSObservation {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	out := make([]DNSObservation, 0)
-	seen := make(map[string]bool)
-	for _, list := range m.observations {
-		for _, o := range list {
-			if o.ObservedAt.Before(cutoff) {
-				continue
-			}
-			key := o.QName + "|" + o.ObservedAt.Format(time.RFC3339Nano)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			out = append(out, o)
-		}
-	}
-	return out
+	lastSweep time.Time
 }
 
 // DNSObservation — одно наблюдение DNS-ответа.
@@ -608,21 +492,60 @@ func NewDNSMapping() *DNSMapping {
 	return &DNSMapping{
 		nameToIPs:    make(map[string]map[string]time.Time),
 		ipToNames:    make(map[string]map[string]time.Time),
-		maxAge:       2 * time.Minute,
+		maxAge:       dnsMapMaxAge,
 		observations: make(map[string][]DNSObservation),
 	}
 }
 
-// Add добавляет связь name → IP.
-func (m *DNSMapping) Add(name, ip string) {
-	if name == "" || ip == "" {
+// Update обрабатывает DNS-ответ: пополняет историю наблюдений и текущие
+// связки. srcIP/dstIP — клиент и резолвер соответственно.
+func (m *DNSMapping) Update(payload []byte, srcIP, dstIP, proto string) {
+	msg := dnsMessage(payload, proto)
+	if msg == nil {
 		return
 	}
+
+	name, ips, ttl, ok := parseDNSResponse(msg)
+	if !ok {
+		return
+	}
+
+	transport := "udp/53"
+	if proto == protoTCP {
+		transport = "tcp/53"
+	}
+
 	now := time.Now()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.addObservationLocked(DNSObservation{
+		QName:      name,
+		Answers:    ips,
+		ObservedAt: now,
+		TTL:        ttl,
+		ClientIP:   srcIP,
+		ResolverIP: dstIP,
+		Transport:  transport,
+	})
+	for _, ip := range ips {
+		m.addLocked(name, ip, now)
+	}
+	m.maybeSweepLocked(now)
+}
+
+// Add добавляет связь name → IP (обновляет lastSeen).
+func (m *DNSMapping) Add(name, ip string) {
+	if name == "" || ip == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addLocked(name, ip, time.Now())
+}
+
+func (m *DNSMapping) addLocked(name, ip string, now time.Time) {
 	if m.nameToIPs[name] == nil {
 		m.nameToIPs[name] = make(map[string]time.Time)
 	}
@@ -642,28 +565,111 @@ func (m *DNSMapping) AddObservation(obs DNSObservation) {
 	if obs.ObservedAt.IsZero() {
 		obs.ObservedAt = time.Now()
 	}
-	if obs.ExpiresAt.IsZero() {
-		if obs.TTL > 0 {
-			obs.ExpiresAt = obs.ObservedAt.Add(time.Duration(obs.TTL) * time.Second)
-		} else {
-			obs.ExpiresAt = obs.ObservedAt.Add(10 * time.Minute)
-		}
-	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addObservationLocked(obs)
+}
+
+func (m *DNSMapping) addObservationLocked(obs DNSObservation) {
+	if obs.ExpiresAt.IsZero() {
+		ttl := dnsFallbackTTL
+		if obs.TTL > 0 {
+			ttl = time.Duration(obs.TTL) * time.Second
+		}
+		obs.ExpiresAt = obs.ObservedAt.Add(ttl)
+	}
 
 	for _, ip := range obs.Answers {
 		key := obs.QName + "|" + ip
-		m.observations[key] = append(m.observations[key], obs)
-		// Ограничиваем историю — максимум 16 записей на пару
-		if len(m.observations[key]) > 16 {
-			m.observations[key] = m.observations[key][len(m.observations[key])-16:]
+		list := append(m.observations[key], obs)
+		if len(list) > obsPerPairMax { // история на пару ограничена
+			list = list[len(list)-obsPerPairMax:]
+		}
+		m.observations[key] = list
+	}
+}
+
+// maybeSweepLocked — периодическая уборка: без неё maps растут бесконечно.
+func (m *DNSMapping) maybeSweepLocked(now time.Time) {
+	if now.Sub(m.lastSweep) < dnsSweepInterval {
+		return
+	}
+	m.lastSweep = now
+
+	// Текущий срез: читатели и так фильтруют по maxAge — освобождаем память.
+	cutoff := now.Add(-m.maxAge)
+	for name, ips := range m.nameToIPs {
+		for ip, t := range ips {
+			if t.Before(cutoff) {
+				delete(ips, ip)
+			}
+		}
+		if len(ips) == 0 {
+			delete(m.nameToIPs, name)
+		}
+	}
+	for ip, names := range m.ipToNames {
+		for name, t := range names {
+			if t.Before(cutoff) {
+				delete(names, name)
+			}
+		}
+		if len(names) == 0 {
+			delete(m.ipToNames, ip)
+		}
+	}
+
+	// История: глубина obsHistoryDepth — старше NamesForIPAt не отвечает.
+	obsCutoff := now.Add(-obsHistoryDepth)
+	for key, list := range m.observations {
+		n := 0
+		for _, o := range list {
+			if o.ObservedAt.After(obsCutoff) {
+				list[n] = o
+				n++
+			}
+		}
+		if n == 0 {
+			delete(m.observations, key)
+		} else {
+			m.observations[key] = list[:n]
 		}
 	}
 }
 
+// SnapshotObservations возвращает все наблюдения DNS.
+func (m *DNSMapping) SnapshotObservations() []DNSObservation {
+	return m.SnapshotObservationsSince(time.Time{})
+}
+
+// SnapshotObservationsSince — наблюдения с ObservedAt >= cutoff.
+func (m *DNSMapping) SnapshotObservationsSince(cutoff time.Time) []DNSObservation {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]DNSObservation, 0)
+	seen := make(map[string]bool)
+	for _, list := range m.observations {
+		for _, o := range list {
+			if o.ObservedAt.Before(cutoff) {
+				continue
+			}
+			// Одно наблюдение лежит под несколькими ключами (по каждому IP
+			// из Answers) — дедуп по (qname, время).
+			key := o.QName + "|" + o.ObservedAt.Format(time.RFC3339Nano)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // NamesForIPAt возвращает имена, чьи наблюдения были актуальны на момент at.
+// O(размер истории): при частых вызовах стоит добавить обратный индекс.
 func (m *DNSMapping) NamesForIPAt(ip string, at time.Time) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -675,13 +681,11 @@ func (m *DNSMapping) NamesForIPAt(ip string, at time.Time) []string {
 			continue
 		}
 		for _, o := range obsList {
-			// Наблюдение должно быть ДО момента at
 			if o.ObservedAt.After(at) {
-				continue
+				continue // наблюдение позже интересующего момента
 			}
-			// И ещё не истекло на момент at
 			if !o.ExpiresAt.IsZero() && o.ExpiresAt.Before(at) {
-				continue
+				continue // к моменту at уже истекло
 			}
 			names[name] = true
 			break
@@ -704,7 +708,7 @@ func splitObsKey(key string) (name, ip string, ok bool) {
 	return "", "", false
 }
 
-// IPsForName возвращает список IP, в которые резолвился name за последнее время.
+// IPsForName возвращает IP, в которые резолвился name за последнее время.
 func (m *DNSMapping) IPsForName(name string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -723,7 +727,7 @@ func (m *DNSMapping) IPsForName(name string) []string {
 	return out
 }
 
-// NamesForIP возвращает список имён, которые резолвились в этот IP.
+// NamesForIP возвращает имена, которые резолвились в этот IP.
 func (m *DNSMapping) NamesForIP(ip string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -740,40 +744,6 @@ func (m *DNSMapping) NamesForIP(ip string) []string {
 		}
 	}
 	return out
-}
-
-// Update обрабатывает DNS-ответ и добавляет связи.
-func (m *DNSMapping) Update(payload []byte, srcIP, dstIP string) {
-	// Сначала пробуем TTL-версию — она даёт наблюдение
-	name2, ips2, ttl, ok2 := parseDNSResponseTTL(payload)
-	if ok2 {
-		now := time.Now()
-		var expiresAt time.Time
-		if ttl > 0 {
-			expiresAt = now.Add(time.Duration(ttl) * time.Second)
-		} else {
-			expiresAt = now.Add(10 * time.Minute)
-		}
-		m.AddObservation(DNSObservation{
-			QName:      name2,
-			Answers:    ips2,
-			ObservedAt: now,
-			ExpiresAt:  expiresAt,
-			TTL:        ttl,
-			ClientIP:   srcIP,
-			ResolverIP: dstIP,
-			Transport:  "udp/53",
-		})
-	}
-
-	// Потом — старый Add для совместимости
-	name, ips, ok := parseDNSResponse(payload)
-	if !ok {
-		return
-	}
-	for _, ip := range ips {
-		m.Add(name, ip)
-	}
 }
 
 // Len возвращает число известных пар name → IP.

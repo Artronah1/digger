@@ -6,11 +6,75 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"digger/internal/dns"
 	"digger/internal/netmap"
 	"digger/internal/proc"
 )
+
+// --- Константы ---
+
+const (
+	// Хранение потоков.
+	flowMaxAge     = time.Hour // простой дольше — поток вычищается
+	flowSweepEvery = time.Minute
+	maxTrackedSeqs = 4096 // предел карты seq на поток (память важнее точности)
+	maxClientHello = 8192 // ClientHello больше не бывает — предел аккумулятора
+	timelineSlots  = 60   // слотов таймлайна (по секунде)
+
+	// Фильтры шума в Print.
+	idleHideAfter  = 30 * time.Second
+	noiseMaxRate   = 1.0   // пакетов/сек
+	noiseMaxAvg    = 100.0 // байт
+	noiseIdleAfter = 10 * time.Second
+	noiseMaxBytes  = 10 * 1024
+
+	maxBarLen = 50 // ширина гистограммы
+)
+
+// --- Классификация ---
+
+// Classification — итоговая классификация потока.
+type Classification int
+
+const (
+	ClassUnknown Classification = iota
+	ClassDirect
+	ClassProxy
+	ClassVPN
+)
+
+func (c Classification) String() string {
+	switch c {
+	case ClassDirect:
+		return "direct"
+	case ClassProxy:
+		return "proxy"
+	case ClassVPN:
+		return "vpn"
+	default:
+		return "unknown"
+	}
+}
+
+// classPriority — приоритет классификации для агрегата (VPN > Proxy > Direct).
+func classPriority(c Classification) int {
+	switch c {
+	case ClassVPN:
+		return 4
+	case ClassProxy:
+		return 3
+	case ClassDirect:
+		return 2
+	case ClassUnknown:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// --- Реконструкция ClientHello ---
 
 type ReconstructionStatus int
 
@@ -55,44 +119,7 @@ func reconPriority(r ReconstructionStatus) int {
 	}
 }
 
-// classPriority — приоритет классификации для агрегата.
-func classPriority(c Classification) int {
-	switch c {
-	case ClassVPN:
-		return 4
-	case ClassProxy:
-		return 3
-	case ClassDirect:
-		return 2
-	case ClassUnknown:
-		return 1
-	default:
-		return 0
-	}
-}
-
-// Classification — итоговая классификация потока.
-type Classification int
-
-const (
-	ClassUnknown Classification = iota
-	ClassDirect
-	ClassProxy
-	ClassVPN
-)
-
-func (c Classification) String() string {
-	switch c {
-	case ClassDirect:
-		return "direct"
-	case ClassProxy:
-		return "proxy"
-	case ClassVPN:
-		return "vpn"
-	default:
-		return "unknown"
-	}
-}
+// --- Структуры ---
 
 type FlowKey struct {
 	LocalIP    string
@@ -100,6 +127,13 @@ type FlowKey struct {
 	RemoteIP   string
 	RemotePort uint16
 	Proto      string
+}
+
+// seqKey — идентификатор сегмента для детекта ретрансмиссий:
+// пара (seq, len), чтобы не путать ресегментацию с ретрансмиссией.
+type seqKey struct {
+	seq uint32
+	len uint32
 }
 
 type FlowStats struct {
@@ -134,11 +168,10 @@ type FlowStats struct {
 	JA3      string
 	JA4      string
 
-	// Timing profile
 	LastPacketTime time.Time
 
-	// Histogram размеров пакетов (по бакетам)
-	SizeBucket0_64    uint64 // 0-64
+	// Гистограмма размеров пакетов.
+	SizeBucket0_64    uint64
 	SizeBucket64_128  uint64
 	SizeBucket128_512 uint64
 	SizeBucket512_1K  uint64
@@ -146,7 +179,7 @@ type FlowStats struct {
 	SizeBucket2K_8K   uint64
 	SizeBucket8KPlus  uint64
 
-	// Histogram интервалов
+	// Гистограмма интервалов.
 	IntervalBucket0_1ms    uint64
 	IntervalBucket1_10ms   uint64
 	IntervalBucket10_100ms uint64
@@ -154,40 +187,39 @@ type FlowStats struct {
 	IntervalBucket1_10s    uint64
 	IntervalBucket10sPlus  uint64
 
-	// VPN-детект
+	// VPN-детект.
 	VPNProto string // "WireGuard" / "OpenVPN" / "IKEv2" / "obfs?" / ""
 	VPNPort  uint16
 	VPNConf  string // "high" / "medium" / "low"
-	VPNSent  bool   // чтобы не дёргать детектор повторно
-	// Итоговая классификация
+	VPNSent  bool
+
 	Class Classification
-	// Timeline: счётчики пакетов по секундам (последние 60 сек)
-	// Используем массив из 60 слотов, индекс = секунда эпохи % 60
-	Timeline    [60]uint64
-	TimelineSet int64 // последняя секунда эпохи, для которой обновляли Timeline
 
-	// tracking исходящих seq для retransmit detection
-	seenSeq       map[uint32]struct{}
-	highestSeq    uint32
-	lastOutSeqEnd uint32
-	seqInit       bool
+	// Timeline: пакеты по секундам, слот = секунда эпохи % 60.
+	Timeline    [timelineSlots]uint64
+	TimelineSet int64 // последняя секунда с пакетом (валидность слотов)
 
-	// Аккумулятор payload'а для извлечения SNI из фрагментированного ClientHello
+	// Детект ретрансмиссий (только TCP, outbound-сегменты с данными).
+	seenSeq    map[seqKey]struct{}
+	highestSeq uint32
+	seqInit    bool
+
+	// Аккумулятор payload для SNI из фрагментированного ClientHello.
 	pendingPayload []byte
 	sniExtracted   bool
 
-	// Насколько полно реконструирован payload
 	Recon ReconstructionStatus
 
-	// Route attribution
 	Route netmap.RouteInfo
 }
 
 // AggregatedFlow — суммарная статистика по SNI (или remote IP).
 type AggregatedFlow struct {
-	Label   string // SNI, или hostname, или remote IP
-	Process string // "icecat(1963)" или "?"
-	Proto   string
+	Label    string // SNI, hostname или remote IP
+	Process  string // "icecat(1963)" / "192.168.1.42 (Xiaomi)" / IP
+	Proto    string
+	SNI      string // настоящий SNI группы (не label)
+	Hostname string // rDNS-имя remote-хоста (не путать с SNI)
 
 	Connections int
 	PacketsOut  uint64
@@ -213,6 +245,62 @@ type AggregatedFlow struct {
 	JA4   string
 }
 
+// AggregatedApp — суммарная статистика по приложению/устройству.
+type AggregatedApp struct {
+	Process  string
+	Display  string // "192.168.1.42 Xiaomi" или "icecat(1963)"
+	IP       string // для device-режима
+	MAC      string
+	Vendor   string
+	Hostname string
+
+	Connections int
+	Domains     int
+	TopDomains  []string // топ-5
+
+	Direct  int
+	Proxy   int
+	VPN     int
+	Unknown int
+
+	PacketsOut uint64
+	BytesOut   uint64
+	PacketsIn  uint64
+	BytesIn    uint64
+	FirstSeen  time.Time
+	LastSeen   time.Time
+}
+
+// DeviceInfo — информация об устройстве LAN.
+type DeviceInfo struct {
+	IP        string
+	MAC       string
+	Vendor    string
+	Hostname  string
+	FirstSeen time.Time
+	LastSeen  time.Time
+
+	Conns     int
+	Domains   int
+	Protocols map[string]bool
+
+	BytesOut uint64
+	BytesIn  uint64
+}
+
+type TCPFlags struct {
+	SYN, ACK, FIN, RST, PSH bool
+
+	MSS           uint16
+	WindowScale   uint8
+	HasTimestamps bool
+	HasSACK       bool
+
+	Payload []byte
+}
+
+// --- FlowTable ---
+
 type FlowTable struct {
 	mu         sync.Mutex
 	flows      map[FlowKey]*FlowStats
@@ -231,6 +319,8 @@ type FlowTable struct {
 	localHostname string
 
 	groupByDevice bool
+
+	lastSweep time.Time
 }
 
 func NewFlowTable() *FlowTable {
@@ -238,11 +328,29 @@ func NewFlowTable() *FlowTable {
 		flows:     make(map[FlowKey]*FlowStats),
 		resolver:  dns.NewResolver(),
 		arpTable:  make(map[string]string),
-		minPkts:   0,
-		hideIdle:  false,
 		vpnIPs:    make(map[string]bool),
 		localMACs: make(map[string]string),
 	}
+}
+
+// Close останавливает resolver и освобождает ресурсы.
+func (ft *FlowTable) Close() {
+	if ft.resolver != nil {
+		ft.resolver.Close()
+	}
+}
+
+// --- Конфигурация ---
+
+func (ft *FlowTable) SetMinPkts(n int)    { ft.mu.Lock(); ft.minPkts = n; ft.mu.Unlock() }
+func (ft *FlowTable) SetHideIdle(v bool)  { ft.mu.Lock(); ft.hideIdle = v; ft.mu.Unlock() }
+func (ft *FlowTable) SetActiveOnly(n int) { ft.mu.Lock(); ft.activeOnly = n; ft.mu.Unlock() }
+
+func (ft *FlowTable) SetAppFilter(s string) {
+	// Единственный сеттер, писавший без лока — гонка с AggregateByApp.
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.appFilter = s
 }
 
 func (ft *FlowTable) SetLocalHostname(h string) {
@@ -257,14 +365,59 @@ func (ft *FlowTable) SetGroupByDevice(v bool) {
 	ft.groupByDevice = v
 }
 
-func (ft *FlowTable) SetMinPkts(n int)      { ft.mu.Lock(); ft.minPkts = n; ft.mu.Unlock() }
-func (ft *FlowTable) SetHideIdle(v bool)    { ft.mu.Lock(); ft.hideIdle = v; ft.mu.Unlock() }
-func (ft *FlowTable) SetActiveOnly(n int)   { ft.mu.Lock(); ft.activeOnly = n; ft.mu.Unlock() }
-func (ft *FlowTable) SetAppFilter(s string) { ft.appFilter = s }
+func (ft *FlowTable) SetLocalMACs(macs map[string]string) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.localMACs = macs
+}
+
+// view — снимок конфигурации и справочников для работы вне лока
+// (arpTable/localMACs пишутся из Enrich — читать их без копии нельзя).
+type view struct {
+	minPkts       int
+	hideIdle      bool
+	activeOnly    int
+	appFilter     string
+	groupByDevice bool
+	localHostname string
+	arpTable      map[string]string
+	localMACs     map[string]string
+}
+
+func (ft *FlowTable) currentView() view {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	v := view{
+		minPkts:       ft.minPkts,
+		hideIdle:      ft.hideIdle,
+		activeOnly:    ft.activeOnly,
+		appFilter:     ft.appFilter,
+		groupByDevice: ft.groupByDevice,
+		localHostname: ft.localHostname,
+	}
+	v.arpTable = copyMap(ft.arpTable)
+	v.localMACs = copyMap(ft.localMACs)
+	return v
+}
+
+func copyMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// --- Горячий путь ---
 
 func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort uint16,
 	proto string, length int, isOutbound bool, tf TCPFlags, seq uint32) {
 
+	// Нормализация: локальная сторона — сторона инициатора.
 	var key FlowKey
 	if isOutbound {
 		key = FlowKey{LocalIP: srcIP, LocalPort: srcPort, RemoteIP: dstIP, RemotePort: dstPort, Proto: proto}
@@ -281,11 +434,10 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 		f = &FlowStats{
 			Key:       key,
 			FirstSeen: now,
-			seenSeq:   make(map[uint32]struct{}),
 			Recon:     ReconUnknown,
 			Class:     ClassUnknown,
 		}
-		// Если remote IP — известная VPN-нода, сразу VPN
+		// Remote IP — известная VPN-нода: сразу VPN.
 		if ft.vpnIPs[key.RemoteIP] {
 			f.Class = ClassVPN
 		}
@@ -293,10 +445,31 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 	}
 	f.LastSeen = now
 
-	// Timing profile: интервал с предыдущего пакета
+	f.trackTiming(now, length)
+	f.trackTimeline(now.Unix())
+
+	if isOutbound {
+		f.PacketsOut++
+		f.BytesOut += uint64(length)
+		// Ретрансмиссии/гэпы — только TCP: у UDP seq всегда 0,
+		// и равные по длине пакеты считались ретрансмиссиями из воздуха.
+		if key.Proto == protoTCP {
+			f.trackOutbound(tf, seq)
+		}
+	} else {
+		f.PacketsIn++
+		f.BytesIn += uint64(length)
+	}
+
+	f.SYN = f.SYN || tf.SYN
+	f.FIN = f.FIN || tf.FIN
+	f.RST = f.RST || tf.RST
+}
+
+// trackTiming обновляет гистограммы интервалов и размеров (под mu).
+func (f *FlowStats) trackTiming(now time.Time, length int) {
 	if !f.LastPacketTime.IsZero() {
-		gap := now.Sub(f.LastPacketTime)
-		switch {
+		switch gap := now.Sub(f.LastPacketTime); {
 		case gap < time.Millisecond:
 			f.IntervalBucket0_1ms++
 		case gap < 10*time.Millisecond:
@@ -313,7 +486,6 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 	}
 	f.LastPacketTime = now
 
-	// Size histogram
 	switch {
 	case length <= 64:
 		f.SizeBucket0_64++
@@ -330,86 +502,85 @@ func (ft *FlowTable) Update(srcIP string, srcPort uint16, dstIP string, dstPort 
 	default:
 		f.SizeBucket8KPlus++
 	}
+}
 
-	// Timeline
-	curSec := now.Unix()
+// trackTimeline ведёт счётчики пакетов по секундам (под mu).
+func (f *FlowStats) trackTimeline(curSec int64) {
 	if f.TimelineSet == 0 {
 		f.TimelineSet = curSec
 	}
 	if curSec != f.TimelineSet {
-		// Сдвигаем timeline вперёд: обнуляем все слоты между TimelineSet и curSec
-		for s := f.TimelineSet + 1; s <= curSec; s++ {
-			f.Timeline[s%60] = 0
+		if curSec-f.TimelineSet >= timelineSlots {
+			// Всё окно устарело — быстрее обнулить целиком,
+			// чем гонять цикл по каждой секунде простоя.
+			f.Timeline = [timelineSlots]uint64{}
+		} else {
+			for s := f.TimelineSet + 1; s <= curSec; s++ {
+				f.Timeline[s%timelineSlots] = 0
+			}
 		}
 		f.TimelineSet = curSec
 	}
-	f.Timeline[curSec%60]++
-
-	if isOutbound {
-		f.PacketsOut++
-		f.BytesOut += uint64(length)
-
-		if !f.MSSKnown && tf.MSS != 0 {
-			f.MSS = tf.MSS
-			f.WindowScale = tf.WindowScale
-			f.HasTimestamps = tf.HasTimestamps
-			f.HasSACK = tf.HasSACK
-			f.MSSKnown = true
-		}
-
-		payloadLen := uint32(len(tf.Payload))
-
-		// Retransmit detection: только для сегментов с данными
-		if !tf.SYN && !tf.FIN && !tf.RST && payloadLen > 0 {
-			// Ключ — пара (seq, длина), чтобы отличить два разных сегмента с одним seq,
-			// но разной длиной (что бывает при сегментации)
-			if _, seen := f.seenSeq[seq]; seen {
-				f.Retransmits++
-			} else {
-				f.seenSeq[seq] = struct{}{}
-
-				// Gap: seq больше, чем все предыдущие + максимум виденного payload
-				if f.seqInit {
-					if seq > f.highestSeq+payloadLen {
-						f.Gaps++
-					}
-				}
-			}
-
-			if seq+payloadLen > f.highestSeq {
-				f.highestSeq = seq + payloadLen
-			}
-			f.seqInit = true
-		}
-	} else {
-		f.PacketsIn++
-		f.BytesIn += uint64(length)
-	}
-
-	if tf.SYN {
-		f.SYN = true
-	}
-	if tf.FIN {
-		f.FIN = true
-	}
-	if tf.RST {
-		f.RST = true
-	}
+	f.Timeline[curSec%timelineSlots]++
 }
 
+// trackOutbound — ретрансмиссии и гэпы по outbound-сегментам с данными
+// (только TCP, под mu).
+func (f *FlowStats) trackOutbound(tf TCPFlags, seq uint32) {
+	if !f.MSSKnown && tf.MSS != 0 {
+		f.MSS = tf.MSS
+		f.WindowScale = tf.WindowScale
+		f.HasTimestamps = tf.HasTimestamps
+		f.HasSACK = tf.HasSACK
+		f.MSSKnown = true
+	}
+
+	payloadLen := uint32(len(tf.Payload))
+	if tf.SYN || tf.FIN || tf.RST || payloadLen == 0 {
+		return
+	}
+
+	if f.seenSeq == nil {
+		f.seenSeq = make(map[seqKey]struct{})
+	}
+	// Предел карты seq: память важнее точности счётчика ретраев
+	// на гигабайтных передачах.
+	if len(f.seenSeq) >= maxTrackedSeqs {
+		f.seenSeq = make(map[seqKey]struct{})
+	}
+
+	k := seqKey{seq, payloadLen}
+	if _, seen := f.seenSeq[k]; seen {
+		f.Retransmits++
+	} else {
+		f.seenSeq[k] = struct{}{}
+		// Гэп: сегмент начинается за концом уже виденного потока.
+		// int32-дельта корректна через wraparound seq (~4 ГБ).
+		if f.seqInit && int32(seq-f.highestSeq) > 0 {
+			f.Gaps++
+		}
+	}
+
+	if delta := int32(seq + payloadLen - f.highestSeq); delta > 0 {
+		f.highestSeq = seq + payloadLen
+	}
+	f.seqInit = true
+}
+
+// --- SNI ---
+
+// SetSNI устанавливает SNI напрямую (например, из QUIC Initial).
 func (ft *FlowTable) SetSNI(key FlowKey, sni string) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
-	if f, ok := ft.flows[key]; ok {
-		if f.SNI == "" {
-			f.SNI = sni
-			f.Recon = ReconComplete
-		}
+	if f, ok := ft.flows[key]; ok && f.SNI == "" {
+		f.SNI = sni
+		f.Recon = ReconComplete
 	}
 }
 
-// AppendPayload аккумулирует payload для потока и пытается извлечь SNI.
-// Возвращает найденный SNI (или "").
+// AppendPayload аккумулирует payload потока (ClientHello может быть
+// фрагментирован) и пытается извлечь SNI. Возвращает найденный SNI (или "").
 func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 	if len(payload) == 0 {
 		return ""
@@ -419,65 +590,65 @@ func (ft *FlowTable) AppendPayload(key FlowKey, payload []byte) string {
 	defer ft.mu.Unlock()
 
 	f, ok := ft.flows[key]
-	if !ok {
-		return ""
-	}
-	if f.sniExtracted {
+	if !ok || f.sniExtracted {
 		return ""
 	}
 
-	// Ограничиваем размер аккумулятора (ClientHello не должен быть больше 8KB)
-	const maxAccum = 8192
 	f.pendingPayload = append(f.pendingPayload, payload...)
-	if len(f.pendingPayload) > maxAccum {
-		f.pendingPayload = f.pendingPayload[:maxAccum]
+	if len(f.pendingPayload) > maxClientHello {
+		f.pendingPayload = f.pendingPayload[:maxClientHello]
 	}
 
-	if sni := extractSNI(f.pendingPayload); sni != "" {
-		if sni == ECHSentinel {
-			f.ECH = true
-			f.SNI = ""
-		} else {
-			f.SNI = sni
-		}
-		f.sniExtracted = true
-		f.Recon = ReconComplete
-
-		// JA3 — отпечаток клиента
-		if f.JA3 == "" {
-			f.JA3 = extractJA3(f.pendingPayload)
-		}
-		// JA4
-		if f.JA4 == "" {
-			f.JA4 = extractJA4(f.pendingPayload)
-		}
-		f.pendingPayload = nil
-		return sni
+	sni := extractSNI(f.pendingPayload)
+	if sni == "" {
+		return ""
 	}
 
-	return ""
+	if sni == ECHSentinel {
+		f.ECH = true
+		f.SNI = ""
+	} else {
+		f.SNI = sni
+	}
+	f.sniExtracted = true
+	f.Recon = ReconComplete
+
+	// JA3/JA4 — отпечатки клиента по тому же ClientHello.
+	if f.JA3 == "" {
+		f.JA3 = extractJA3(f.pendingPayload)
+	}
+	if f.JA4 == "" {
+		f.JA4 = extractJA4(f.pendingPayload)
+	}
+	f.pendingPayload = nil
+	return sni
 }
 
-// SetLocalMACs устанавливает MAC-адреса локальных интерфейсов (IP → MAC).
-func (ft *FlowTable) SetLocalMACs(macs map[string]string) {
-	ft.mu.Lock()
-	defer ft.mu.Unlock()
-	ft.localMACs = macs
-}
+// --- Enrichment ---
 
+// Enrich привязывает процессы, имена, маршруты и классификацию.
+// Дорогой I/O (rDNS, маршруты) вынесен из-под лока — раньше горутина
+// пакетов стояла на время сетевых таймаутов. Заодно lookup'ы делаются
+// по уникальным IP, а не по каждому потоку.
 func (ft *FlowTable) Enrich() {
+	// Сканирование окружения — вне лока.
 	socketsByTuple, _ := proc.ScanSockets()
 	socketsByPort, _ := proc.ScanSocketsByLocalPort()
 	inodes, _ := proc.MapInodesToPIDs()
 	arp := proc.ScanARP()
 
+	// Фаза 1 (под локом): привязка процессов, вычистка, сбор работы.
 	ft.mu.Lock()
-	defer ft.mu.Unlock()
 
 	ft.arpTable = arp
+	ft.sweepLocked(time.Now())
 
-	for _, f := range ft.flows {
-		// Привязка процесса
+	needHostname := make(map[string]bool)
+	needRoute := make(map[string]bool)
+	needSNI := make(map[string]bool)
+	var work []FlowKey
+
+	for key, f := range ft.flows {
 		if f.Comm == "" {
 			tupleKey := proc.SocketKey{
 				LocalIP:    f.Key.LocalIP,
@@ -487,6 +658,8 @@ func (ft *FlowTable) Enrich() {
 			}
 			inode, ok := socketsByTuple[tupleKey]
 			if !ok {
+				// Fallback по локальному порту: неточен (порт могли
+				// переиспользовать), но лучше, чем ничего.
 				inode, ok = socketsByPort[f.Key.LocalPort]
 			}
 			if ok {
@@ -497,40 +670,99 @@ func (ft *FlowTable) Enrich() {
 			}
 		}
 
-		// Hostname
-		if f.Hostname == "" {
-			f.Hostname = ft.resolver.Lookup(f.Key.RemoteIP)
+		touch := false
+		if f.Hostname == "" && f.Key.RemoteIP != "" {
+			needHostname[f.Key.RemoteIP] = true
+			touch = true
 		}
-
-		// Route attribution
 		if f.Route.Interface == "" && f.Key.RemoteIP != "" {
-			f.Route = netmap.LookupRoute(f.Key.RemoteIP)
+			needRoute[f.Key.RemoteIP] = true
+			touch = true
+		}
+		if f.Class == ClassUnknown && f.SNI != "" { // ← добавили
+			needSNI[f.SNI] = true
+			touch = true
+		}
+		if f.Class == ClassUnknown {
+			touch = true
+		}
+		if touch {
+			work = append(work, key)
+		}
+	}
+	ft.mu.Unlock()
+
+	if len(work) == 0 {
+		return
+	}
+
+	// Фаза 2 (без лока): сетевые запросы по уникальным IP.
+	hostnames := make(map[string]string, len(needHostname))
+	for ip := range needHostname {
+		hostnames[ip] = ft.resolver.Lookup(ip)
+	}
+	routes := make(map[string]netmap.RouteInfo, len(needRoute))
+	for ip := range needRoute {
+		routes[ip] = netmap.LookupRoute(ip)
+	}
+
+	// ClassifyFlow → resolveSNIAt → net.LookupIP — блокирующий DNS,
+	// а фаза 3 идёт под ft.mu. Прогреваем кэш заранее.
+	for sni := range needSNI {
+		resolveSNI(sni)
+	}
+	// Фаза 3 (под локом): применяем и классифицируем.
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	for _, key := range work {
+		f, ok := ft.flows[key]
+		if !ok {
+			continue
 		}
 
-		// Классификация: если процесс-прокси и SNI не резолвится — VPN-нода
+		if f.Hostname == "" {
+			f.Hostname = hostnames[f.Key.RemoteIP]
+		}
+		if f.Route.Interface == "" {
+			f.Route = routes[f.Key.RemoteIP]
+		}
+
+		// Прокси-процесс + SNI не резолвится → это VPN-нода.
 		if f.Class == ClassUnknown && f.Comm != "" &&
 			looksLikeProxyProcess(f.Comm) && f.SNI != "" {
 			res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, ft.dnsMapping)
 			if res.Reason == "not-resolved" {
 				f.Class = ClassVPN
-				if ft.vpnIPs == nil {
-					ft.vpnIPs = make(map[string]bool)
-				}
 				ft.vpnIPs[f.Key.RemoteIP] = true
 			}
 		}
-
-		// Если IP уже помечен как VPN-нода — ставим ClassVPN
 		if f.Class == ClassUnknown && ft.vpnIPs[f.Key.RemoteIP] {
 			f.Class = ClassVPN
 		}
-		// Если поток ещё не классифицирован — классифицируем
 		if f.Class == ClassUnknown {
 			f.Class = ClassifyFlow(f, ft.dnsMapping)
 		}
 	}
 }
 
+// sweepLocked вычищает давно неактивные потоки: без этого ft.flows
+// и seenSeq внутри них растут бесконечно (вызывается под mu).
+func (ft *FlowTable) sweepLocked(now time.Time) {
+	if now.Sub(ft.lastSweep) < flowSweepEvery {
+		return
+	}
+	ft.lastSweep = now
+
+	cutoff := now.Add(-flowMaxAge)
+	for key, f := range ft.flows {
+		if f.LastSeen.Before(cutoff) {
+			delete(ft.flows, key)
+		}
+	}
+}
+
+// Snapshot возвращает копию потоков, свежие сверху.
 func (ft *FlowTable) Snapshot() []FlowStats {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
@@ -539,28 +771,33 @@ func (ft *FlowTable) Snapshot() []FlowStats {
 	for _, f := range ft.flows {
 		out = append(out, *f)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeen.After(out[j].LastSeen)
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
 	return out
 }
 
-// Aggregate группирует потоки по SNI/hostname/IP и возвращает суммарную статистику.
+// --- Агрегация ---
+
+// Aggregate группирует потоки по SNI/hostname/IP.
 func (ft *FlowTable) Aggregate() []AggregatedFlow {
-	flows := ft.Snapshot()
+	return ft.aggregateFrom(ft.Snapshot())
+}
+
+func (ft *FlowTable) aggregateFrom(flows []FlowStats) []AggregatedFlow {
+	v := ft.currentView()
 
 	groups := make(map[string]*AggregatedFlow)
 
 	for i := range flows {
 		f := &flows[i]
 
-		// Пропускаем LAN-трафик (к локальным адресам) — это не интересно для аудита
+		// LAN-трафик для аудита не интересен.
 		if isLANIP(f.Key.RemoteIP) {
 			continue
 		}
 
 		label := f.SNI
 		if label == "" && f.Hostname != "" {
+			// 1e100.net — «безымянные» хосты Google: IP информативнее.
 			if !strings.HasSuffix(f.Hostname, ".1e100.net") {
 				label = f.Hostname
 			}
@@ -569,30 +806,23 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 			label = f.Key.RemoteIP
 		}
 
-		// Пометка о неполной реконструкции — только для TCP/443
-		reconNote := ""
-		if f.Key.Proto == "TCP" && f.Key.RemotePort == 443 {
+		// Пометка о неполной реконструкции — только TCP/443.
+		if f.Key.Proto == protoTCP && f.Key.RemotePort == portHTTPS {
 			switch f.Recon {
 			case ReconGap:
-				reconNote = " ⚠gap"
+				label += " ⚠gap"
 			case ReconPartial:
-				reconNote = " ⚠partial"
+				label += " ⚠partial"
 			}
 		}
-		if reconNote != "" {
-			label += reconNote
-		}
 
-		process := "?"
+		process := f.Key.LocalIP
 		if f.Comm != "" {
 			process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
-		} else if mac, ok := ft.arpTable[f.Key.LocalIP]; ok {
+		} else if mac, ok := v.arpTable[f.Key.LocalIP]; ok {
 			process = fmt.Sprintf("%s (%s)", f.Key.LocalIP, proc.DescribeMAC(mac))
-		} else {
-			process = f.Key.LocalIP
 		}
 
-		// Добавляем флаг к label
 		key := label + "|" + process + "|" + f.Key.Proto
 
 		g, ok := groups[key]
@@ -606,30 +836,40 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 			groups[key] = g
 		}
 
+		if g.SNI == "" {
+			g.SNI = f.SNI
+		}
+		if g.Hostname == "" {
+			g.Hostname = f.Hostname
+		}
+
 		g.Connections++
 		g.PacketsOut += f.PacketsOut
 		g.BytesOut += f.BytesOut
 		g.PacketsIn += f.PacketsIn
 		g.BytesIn += f.BytesIn
 		g.Retransmits += f.Retransmits
-		// Агрегируем Recon: если хотя бы один поток complete — значит SNI есть
-		if g.Recon == ReconUnknown || reconPriority(f.Recon) > reconPriority(g.Recon) {
+		g.Gaps += f.Gaps
+
+		if reconPriority(f.Recon) > reconPriority(g.Recon) {
 			g.Recon = f.Recon
 		}
-		// Классификация: VPN > PROXY > DIRECT > UNKNOWN
 		if classPriority(f.Class) > classPriority(g.Class) {
 			g.Class = f.Class
 		}
-		g.Gaps += f.Gaps
 
-		if f.ECH {
-			g.ECH = true
-		}
-		if g.JA3 == "" && f.JA3 != "" {
+		g.ECH = g.ECH || f.ECH
+		if g.JA3 == "" {
 			g.JA3 = f.JA3
 		}
-		if g.JA4 == "" && f.JA4 != "" {
+		if g.JA4 == "" {
 			g.JA4 = f.JA4
+		}
+		if g.SNI == "" {
+			g.SNI = f.SNI
+		}
+		if g.Hostname == "" {
+			g.Hostname = f.Hostname
 		}
 		if f.LastSeen.After(g.LastSeen) {
 			g.LastSeen = f.LastSeen
@@ -645,96 +885,70 @@ func (ft *FlowTable) Aggregate() []AggregatedFlow {
 		if g.Route.Interface == "" && f.Route.Interface != "" {
 			g.Route = f.Route
 		}
-
-	} // ← вот эта } закрывает for _, f := range flows
+	}
 
 	out := make([]AggregatedFlow, 0, len(groups))
 	for _, g := range groups {
 		out = append(out, *g)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeen.After(out[j].LastSeen)
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
 	return out
 }
 
-// isNoisy определяет keep-alive-подобные потоки.
-func isNoisy(f *FlowStats) bool {
-	totalPkts := f.PacketsOut + f.PacketsIn
+// --- Вывод ---
+
+// isNoisyGroup — keep-alive-подобные группы: медленно и мелко, либо
+// давно затихшие и крошечные. Прежний isNoisy был мёртвым кодом,
+// а его логика дублировалась в Print инлайном.
+func isNoisyGroup(g AggregatedFlow, now time.Time) bool {
+	totalPkts := g.PacketsOut + g.PacketsIn
 	if totalPkts == 0 {
 		return true
 	}
-	totalBytes := f.BytesOut + f.BytesIn
+	totalBytes := g.BytesOut + g.BytesIn
+
+	ageSec := now.Sub(g.FirstSeen).Seconds()
+	if ageSec <= 0 {
+		ageSec = 1
+	}
+	pktPerSec := float64(totalPkts) / ageSec
 	avgSize := float64(totalBytes) / float64(totalPkts)
 
-	age := time.Since(f.FirstSeen).Seconds()
-	if age <= 0 {
-		age = 1
-	}
-	pktPerSec := float64(totalPkts) / age
-
-	// Классический keep-alive: медленно и маленькие пакеты
-	if pktPerSec < 1.0 && avgSize < 100 {
+	// Классический keep-alive: медленно и маленькими пакетами.
+	if pktPerSec < noiseMaxRate && avgSize < noiseMaxAvg {
 		return true
 	}
-	// Затихший поток: активность > 10 сек назад, объём < 10 KB
-	if time.Since(f.LastSeen) > 10*time.Second && totalBytes < 10*1024 {
-		return true
-	}
-	return false
+	// Затихший поток: активность давно, объём крошечный.
+	return now.Sub(g.LastSeen) > noiseIdleAfter && totalBytes < noiseMaxBytes
 }
 
 func (ft *FlowTable) Print() {
-	ft.mu.Lock()
-	minPkts := ft.minPkts
-	hideIdle := ft.hideIdle
-	activeOnly := ft.activeOnly
-	ft.mu.Unlock()
-
+	v := ft.currentView()
 	allGroups := ft.Aggregate()
 
 	groups := make([]AggregatedFlow, 0, len(allGroups))
-	hiddenByPkts := 0
-	hiddenByIdle := 0
-	hiddenByNoise := 0
-	hiddenByActive := 0
+	var hiddenByPkts, hiddenByIdle, hiddenByActive, hiddenByNoise int
 	now := time.Now()
 
 	for _, g := range allGroups {
 		totalPkts := g.PacketsOut + g.PacketsIn
 
-		if minPkts > 0 && totalPkts < uint64(minPkts) {
+		if v.minPkts > 0 && totalPkts < uint64(v.minPkts) {
 			hiddenByPkts++
 			continue
 		}
-		if hideIdle && now.Sub(g.LastSeen) > 30*time.Second {
+		if v.hideIdle && now.Sub(g.LastSeen) > idleHideAfter {
 			hiddenByIdle++
 			continue
 		}
-		if activeOnly > 0 && now.Sub(g.LastSeen) > time.Duration(activeOnly)*time.Second {
+		if v.activeOnly > 0 && now.Sub(g.LastSeen) > time.Duration(v.activeOnly)*time.Second {
 			hiddenByActive++
 			continue
 		}
-		// isNoisy проверяем по агрегату: медленно и мелко
-		totalBytes := g.BytesOut + g.BytesIn
-		ageSec := time.Since(g.FirstSeen).Seconds()
-		if ageSec <= 0 {
-			ageSec = 1
-		}
-		pktPerSec := float64(totalPkts) / ageSec
-		var avgSize float64
-		if totalPkts > 0 {
-			avgSize = float64(totalBytes) / float64(totalPkts)
-		}
-		if pktPerSec < 1.0 && avgSize < 100 {
+		if isNoisyGroup(g, now) {
 			hiddenByNoise++
 			continue
 		}
-		if now.Sub(g.LastSeen) > 10*time.Second && totalBytes < 10*1024 {
-			hiddenByNoise++
-			continue
-		}
-
 		groups = append(groups, g)
 	}
 
@@ -745,8 +959,7 @@ func (ft *FlowTable) Print() {
 	}
 
 	fmt.Printf("\n=== Группы по SNI (%d", len(groups))
-	hidden := hiddenByPkts + hiddenByIdle + hiddenByActive + hiddenByNoise
-	if hidden > 0 {
+	if hidden := hiddenByPkts + hiddenByIdle + hiddenByActive + hiddenByNoise; hidden > 0 {
 		fmt.Printf(", скрыто: %d pkts / %d idle / %d active / %d шум",
 			hiddenByPkts, hiddenByIdle, hiddenByActive, hiddenByNoise)
 	}
@@ -769,11 +982,8 @@ func (ft *FlowTable) Print() {
 			avgSize = float64(totalBytes) / float64(totalPkts)
 		}
 
-		process := g.Process
-		label := truncate(g.Label, 32)
-
 		reconStr := "—"
-		if g.Proto == "TCP" {
+		if g.Proto == protoTCP {
 			if g.ECH {
 				reconStr = "ech"
 			} else {
@@ -791,17 +1001,16 @@ func (ft *FlowTable) Print() {
 				}
 			}
 		}
-		classStr := g.Class.String()
 		routeStr := g.Route.Interface
 		if routeStr == "" {
 			routeStr = "—"
 		}
 
 		fmt.Printf("%-28s %-32s %-7s %-8s %-12s %-5s %5d %8.1f %8.0f %10s %10s %4d %4d %5s\n",
-			truncate(process, 28),
-			label,
+			truncate(g.Process, 28),
+			truncate(g.Label, 32),
 			reconStr,
-			classStr,
+			g.Class.String(),
 			truncate(routeStr, 12),
 			g.Proto,
 			g.Connections,
@@ -816,53 +1025,14 @@ func (ft *FlowTable) Print() {
 	fmt.Println()
 }
 
-// humanBytes форматирует байты в человекочитаемый вид.
-func humanBytes(b uint64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := uint64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	if n <= 1 {
-		return s[:n]
-	}
-	return s[:n-1] + "…"
-}
-
-type TCPFlags struct {
-	SYN, ACK, FIN, RST, PSH bool
-
-	MSS           uint16
-	WindowScale   uint8
-	HasTimestamps bool
-	HasSACK       bool
-
-	Payload []byte
-}
-
 // PrintProfile печатает тайминг-профиль для указанного SNI.
-// Если matchSNI пуст — ничего не делает.
 func (ft *FlowTable) PrintProfile(matchSNI string) {
 	if matchSNI == "" {
 		return
 	}
 
-	flows := ft.Snapshot()
-
-	// Собираем все потоки с этим SNI
 	var matched []FlowStats
-	for _, f := range flows {
+	for _, f := range ft.Snapshot() {
 		if f.SNI == matchSNI {
 			matched = append(matched, f)
 		}
@@ -872,15 +1042,16 @@ func (ft *FlowTable) PrintProfile(matchSNI string) {
 		return
 	}
 
-	// Суммируем метрики по всем потокам с этим SNI
 	var (
 		intervalBuckets [6]uint64
 		sizeBuckets     [7]uint64
-		timeline        [60]uint64
+		timeline        [timelineSlots]uint64
 		totalBytesOut   uint64
 		totalBytesIn    uint64
 		totalPkts       uint64
 	)
+
+	now := time.Now().Unix()
 
 	for _, f := range matched {
 		intervalBuckets[0] += f.IntervalBucket0_1ms
@@ -898,9 +1069,17 @@ func (ft *FlowTable) PrintProfile(matchSNI string) {
 		sizeBuckets[5] += f.SizeBucket2K_8K
 		sizeBuckets[6] += f.SizeBucket8KPlus
 
-		for i := 0; i < 60; i++ {
-			timeline[i] += f.Timeline[i]
+		// Слот актуален только для секунд <= TimelineSet: слоты ПОСЛЕ
+		// последнего пакета не обнулены и хранят данные минутной
+		// давности, маскируясь под свежую активность.
+		for i := 0; i < timelineSlots; i++ {
+			sec := now - 59 + int64(i)
+			if sec > f.TimelineSet {
+				continue
+			}
+			timeline[i] += f.Timeline[sec%timelineSlots]
 		}
+
 		totalBytesOut += f.BytesOut
 		totalBytesIn += f.BytesIn
 		totalPkts += f.PacketsOut + f.PacketsIn
@@ -912,7 +1091,6 @@ func (ft *FlowTable) PrintProfile(matchSNI string) {
 	fmt.Printf("  Потоков: %d   Пакетов: %d   OUT: %s   IN: %s\n\n",
 		len(matched), totalPkts, humanBytes(totalBytesOut), humanBytes(totalBytesIn))
 
-	// Интервалы
 	fmt.Println("  ── Интервалы между пакетами ──")
 	printHistogram("  <1ms       ", intervalBuckets[0], totalPkts)
 	printHistogram("  1-10ms     ", intervalBuckets[1], totalPkts)
@@ -931,12 +1109,10 @@ func (ft *FlowTable) PrintProfile(matchSNI string) {
 	printHistogram("  2K-8K      ", sizeBuckets[5], totalPkts)
 	printHistogram("  >8K        ", sizeBuckets[6], totalPkts)
 
-	// Timeline
 	fmt.Println()
 	fmt.Println("  ── Timeline (последние 60 сек, слева = старая) ──")
-	now := time.Now().Unix()
 	maxVal := uint64(0)
-	for i := 0; i < 60; i++ {
+	for i := 0; i < timelineSlots; i++ {
 		if timeline[i] > maxVal {
 			maxVal = timeline[i]
 		}
@@ -944,28 +1120,25 @@ func (ft *FlowTable) PrintProfile(matchSNI string) {
 	if maxVal == 0 {
 		fmt.Println("  (нет данных)")
 	} else {
-		// Печатаем bar-график: 60 символов, по одному на секунду
 		fmt.Print("  ")
-		for i := 0; i < 60; i++ {
-			sec := (now - 59 + int64(i)) % 60
-			val := timeline[sec]
+		for i := 0; i < timelineSlots; i++ {
+			sec := now - 59 + int64(i)
+			val := timeline[sec%timelineSlots]
 			if val == 0 {
 				fmt.Print(" ")
-			} else {
-				// 5 уровней интенсивности
-				ratio := float64(val) / float64(maxVal)
-				switch {
-				case ratio < 0.2:
-					fmt.Print(".")
-				case ratio < 0.4:
-					fmt.Print(":")
-				case ratio < 0.6:
-					fmt.Print("|")
-				case ratio < 0.8:
-					fmt.Print("H")
-				default:
-					fmt.Print("#")
-				}
+				continue
+			}
+			switch ratio := float64(val) / float64(maxVal); {
+			case ratio < 0.2:
+				fmt.Print(".")
+			case ratio < 0.4:
+				fmt.Print(":")
+			case ratio < 0.6:
+				fmt.Print("|")
+			case ratio < 0.8:
+				fmt.Print("H")
+			default:
+				fmt.Print("#")
 			}
 		}
 		fmt.Println()
@@ -981,90 +1154,62 @@ func printHistogram(label string, count, total uint64) {
 		return
 	}
 	pct := float64(count) / float64(total) * 100
-	barLen := int(pct / 2) // 50 символов максимум
-	if barLen > 50 {
-		barLen = 50
+	barLen := int(pct / 2)
+	if barLen > maxBarLen {
+		barLen = maxBarLen
 	}
-	bar := ""
-	for i := 0; i < barLen; i++ {
-		bar += "█"
-	}
-	fmt.Printf("%s %8d  %5.1f%%  %s\n", label, count, pct, bar)
-}
-
-// AggregatedApp — суммарная статистика по приложению/устройству.
-type AggregatedApp struct {
-	Process  string
-	Display  string // человекочитаемое: "192.168.1.42 Xiaomi (phone.local)"
-	IP       string // для device-режима
-	MAC      string
-	Vendor   string
-	Hostname string
-
-	Connections int
-	Domains     int
-	TopDomains  []string // топ-5 доменов
-
-	// Классификация
-	Direct  int
-	Proxy   int
-	VPN     int
-	Unknown int
-
-	PacketsOut uint64
-	BytesOut   uint64
-	PacketsIn  uint64
-	BytesIn    uint64
-	FirstSeen  time.Time
-	LastSeen   time.Time
+	fmt.Printf("%s %8d  %5.1f%%  %s\n", label, count, pct, strings.Repeat("█", barLen))
 }
 
 // AggregateByApp группирует потоки по процессу (или устройству).
 func (ft *FlowTable) AggregateByApp() []AggregatedApp {
-	flows := ft.Snapshot()
+	return ft.aggregateByAppFrom(ft.Snapshot())
+}
+
+func (ft *FlowTable) aggregateByAppFrom(flows []FlowStats) []AggregatedApp {
+	v := ft.currentView()
+
+	type classCounts struct{ direct, proxy, vpn, unknown int }
 
 	groups := make(map[string]*AggregatedApp)
 	domainsByApp := make(map[string]map[string]int)
-	classesByApp := make(map[string]map[string]int)
+	classesByApp := make(map[string]*classCounts)
 
 	for i := range flows {
 		f := &flows[i]
 
-		// Определяем "приложение" или "устройство"
-		var process, display, ip, mac, vendor, hostname string
+		// LAN-трафик для аудита не интересен.
+		if isLANIP(f.Key.RemoteIP) {
+			continue
+		}
 
-		if ft.groupByDevice {
-			// device-режим: группировка по IP устройства
+		var process, display, ip, mac, vendor string
+
+		if v.groupByDevice {
+			// device-режим: группировка по IP устройства.
 			ip = f.Key.LocalIP
 			process = ip
 
-			// MAC
-			mac = ft.arpTable[ip]
+			mac = v.arpTable[ip]
 			if mac == "" {
-				mac = ft.localMACs[ip]
+				mac = v.localMACs[ip]
 			}
 			if mac != "" {
 				vendor = proc.DescribeMAC(mac)
 			}
 
-			// Hostname
-			if f.Hostname != "" {
-				hostname = f.Hostname
-			}
-
-			// Display
 			display = ip
 			if vendor != "" && vendor != "unknown" {
 				display += " " + vendor
 			}
-			if hostname != "" {
-				display += " (" + hostname + ")"
-			}
+			// Hostname устройства по PTR удалённого хоста не
+			// восстанавливается — раньше f.Hostname (rDNS REMOTE)
+			// ошибочно писался как имя устройства.
 		} else {
-			// app-режим
+			// app-режим.
 			if f.Comm != "" {
 				process = fmt.Sprintf("%s(%d)", f.Comm, f.PID)
-			} else if m, ok := ft.arpTable[f.Key.LocalIP]; ok {
+			} else if m, ok := v.arpTable[f.Key.LocalIP]; ok {
 				process = fmt.Sprintf("%s (%s)", f.Key.LocalIP, proc.DescribeMAC(m))
 			} else {
 				process = f.Key.LocalIP
@@ -1072,13 +1217,7 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 			display = process
 		}
 
-		// Фильтр по приложению
-		if ft.appFilter != "" && !strings.Contains(display, ft.appFilter) {
-			continue
-		}
-
-		// Пропускаем LAN-трафик
-		if isLANIP(f.Key.RemoteIP) {
+		if v.appFilter != "" && !strings.Contains(display, v.appFilter) {
 			continue
 		}
 
@@ -1090,12 +1229,11 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 				IP:        ip,
 				MAC:       mac,
 				Vendor:    vendor,
-				Hostname:  hostname,
 				FirstSeen: f.FirstSeen,
 			}
 			groups[process] = g
 			domainsByApp[process] = make(map[string]int)
-			classesByApp[process] = make(map[string]int)
+			classesByApp[process] = &classCounts{}
 		}
 
 		g.Connections++
@@ -1111,7 +1249,6 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 			g.FirstSeen = f.FirstSeen
 		}
 
-		// Считаем уникальные домены
 		label := f.SNI
 		if label == "" {
 			label = f.Hostname
@@ -1120,51 +1257,54 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 			label = f.Key.RemoteIP
 		}
 		domainsByApp[process][label]++
-		classesByApp[process][string(f.Class)]++
+
+		cc := classesByApp[process]
+		switch f.Class {
+		case ClassDirect:
+			cc.direct++
+		case ClassProxy:
+			cc.proxy++
+		case ClassVPN:
+			cc.vpn++
+		default:
+			cc.unknown++
+		}
 	}
 
 	out := make([]AggregatedApp, 0, len(groups))
 	for name, g := range groups {
 		g.Domains = len(domainsByApp[name])
 
-		// Топ-5 доменов по количеству
-		top := make([]string, 0)
+		// Топ-5 доменов по числу потоков; при равенстве — по алфавиту,
+		// чтобы вывод не прыгал между циклами печати.
 		type kv struct {
 			k string
 			v int
 		}
-		var pairs []kv
-		for k, v := range domainsByApp[name] {
-			pairs = append(pairs, kv{k, v})
+		pairs := make([]kv, 0, len(domainsByApp[name]))
+		for k, cnt := range domainsByApp[name] {
+			pairs = append(pairs, kv{k, cnt})
 		}
 		sort.Slice(pairs, func(i, j int) bool {
-			return pairs[i].v > pairs[j].v
+			if pairs[i].v != pairs[j].v {
+				return pairs[i].v > pairs[j].v
+			}
+			return pairs[i].k < pairs[j].k
 		})
 		for i, p := range pairs {
 			if i >= 5 {
 				break
 			}
-			top = append(top, p.k)
+			g.TopDomains = append(g.TopDomains, p.k)
 		}
-		g.TopDomains = top
 
-		// Классификация
-		for cls, n := range classesByApp[name] {
-			switch cls {
-			case "direct":
-				g.Direct = n
-			case "proxy":
-				g.Proxy = n
-			case "vpn":
-				g.VPN = n
-			default:
-				g.Unknown = n
-			}
-		}
+		cc := classesByApp[name]
+		g.Direct, g.Proxy, g.VPN, g.Unknown = cc.direct, cc.proxy, cc.vpn, cc.unknown
 
 		out = append(out, *g)
 	}
 
+	// Сверху — самые «тяжёлые».
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].BytesIn+out[i].BytesOut > out[j].BytesIn+out[j].BytesOut
 	})
@@ -1173,19 +1313,20 @@ func (ft *FlowTable) AggregateByApp() []AggregatedApp {
 
 // PrintApps выводит таблицу приложений/устройств.
 func (ft *FlowTable) PrintApps() {
+	v := ft.currentView()
 	apps := ft.AggregateByApp()
 	if len(apps) == 0 {
 		return
 	}
 
 	title := "Приложения"
-	if ft.groupByDevice {
+	if v.groupByDevice {
 		title = "Устройства"
 	}
 
 	fmt.Printf("\n=== %s (%d) ===\n", title, len(apps))
 
-	if ft.groupByDevice {
+	if v.groupByDevice {
 		fmt.Printf("%-16s %-18s %-14s %6s %6s %5s %5s %5s %10s %10s %6s\n",
 			"IP", "MAC", "HOSTNAME", "CONNS", "DOMAINS", "DIR", "PRX", "VPN", "OUT", "IN", "AGE")
 	} else {
@@ -1196,7 +1337,7 @@ func (ft *FlowTable) PrintApps() {
 	for _, a := range apps {
 		age := time.Since(a.FirstSeen).Truncate(time.Second)
 
-		if ft.groupByDevice {
+		if v.groupByDevice {
 			mac := a.MAC
 			if mac == "" {
 				mac = "—"
@@ -1233,8 +1374,9 @@ func (ft *FlowTable) PrintApps() {
 	fmt.Println()
 }
 
-// FindProcessByIP ищет процесс, у которого есть поток к указанному IP.
-// Используется для связи аномалий с процессами.
+// --- Поиск процессов ---
+
+// FindProcessByIP ищет процесс с потоком к указанному IP.
 func (ft *FlowTable) FindProcessByIP(ip string) string {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
@@ -1260,10 +1402,14 @@ func (ft *FlowTable) FindProcessByDomain(domain string) string {
 	return ""
 }
 
-// MarkVPN фиксирует результат детектора VPN в потоке.
+// --- VPN / классификация ---
+
+// MarkVPN фиксирует результат детектора и запоминает ноду:
+// все будущие потоки к этому IP классифицируются как VPN.
 func (ft *FlowTable) MarkVPN(srcIP string, srcPort uint16, dstIP string, dstPort uint16,
 	proto string, det *VPNDetection) {
 
+	// Вызывается только для outbound: src — локальная сторона.
 	key := FlowKey{
 		LocalIP:    srcIP,
 		LocalPort:  srcPort,
@@ -1275,86 +1421,65 @@ func (ft *FlowTable) MarkVPN(srcIP string, srcPort uint16, dstIP string, dstPort
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 
-	f, ok := ft.flows[key]
-	if !ok {
-		return
-	}
-	if f.VPNProto == "" {
+	if f, ok := ft.flows[key]; ok && f.VPNProto == "" {
 		f.VPNProto = det.Proto
 		f.VPNPort = det.Port
 		f.VPNConf = det.Confidence
 		f.Class = ClassVPN
 	}
 
-	// Запоминаем IP VPN-ноды — все будущие потоки к нему будут VPN
 	if ft.vpnIPs == nil {
 		ft.vpnIPs = make(map[string]bool)
 	}
-	ft.vpnIPs[dstIP] = true
+	if det.Confidence != "low" {
+		ft.vpnIPs[dstIP] = true
+	}
 }
 
 // ClassifyFlow определяет итоговую классификацию потока.
-// mapping используется для проверки SNI ↔ DNS. Может быть nil.
+// mapping используется для проверки SNI ↔ DNS; может быть nil.
 func ClassifyFlow(f *FlowStats, mapping *DNSMapping) Classification {
-	// 0. ECH — SNI скрыт, но это не прокси
+	// ECH: SNI скрыт, но это не признак прокси.
 	if f.ECH {
 		return ClassDirect
 	}
-	// 1. VPN — если детектор сработал
-	if f.VPNProto != "" {
+	// VPN-детектор сработал.
+	if f.VPNProto != "" && f.VPNConf != "low" {
 		return ClassVPN
 	}
-
-	// 2. Прокси-процесс + нет SNI — прокси
+	// Прокси-процесс без SNI.
 	if looksLikeProxyProcess(f.Comm) && f.SNI == "" {
 		return ClassProxy
 	}
 
-	// 3. SNI есть — проверяем через resolveSNIAt
 	if f.SNI != "" {
 		res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, mapping)
 		switch res.Reason {
 		case "matched":
 			return ClassDirect
 		case "not-resolved":
-			// Домен не резолвится — прокси-фронт
-			return ClassProxy
+			return ClassProxy // домен не резолвится — прокси-фронт
 		case "different-ip":
-			// Резолвится в другой IP — CDN-балансировка, не прокси
-			return ClassDirect
+			return ClassDirect // CDN-балансировка, не прокси
 		case "no-observation":
 			if len(res.ObservedIPs) > 0 {
-				// Резолвится — CDN, не прокси
-				return ClassDirect
+				return ClassDirect // резолвится, просто сам ответ не видели
 			}
 		}
 	}
 
-	// 4. Не смогли определить
 	return ClassUnknown
 }
 
-// DeviceInfo — информация об устройстве LAN.
-type DeviceInfo struct {
-	IP        string
-	MAC       string
-	Vendor    string
-	Hostname  string
-	FirstSeen time.Time
-	LastSeen  time.Time
+// --- Устройства LAN ---
 
-	Conns     int
-	Domains   int
-	Protocols map[string]bool
-
-	BytesOut uint64
-	BytesIn  uint64
+// BuildDevices собирает LAN-клиентов (не роутер) из flows.
+func (ft *FlowTable) BuildDevices() []DeviceInfo {
+	return ft.buildDevicesFrom(ft.Snapshot())
 }
 
-// BuildDevices собирает устройства LAN из flows.
-// Устройство — это LAN-клиент, не роутер.
-func (ft *FlowTable) BuildDevices() []DeviceInfo {
-	flows := ft.Snapshot()
+func (ft *FlowTable) buildDevicesFrom(flows []FlowStats) []DeviceInfo {
+	v := ft.currentView()
 
 	devices := make(map[string]*DeviceInfo)
 	domainsByIP := make(map[string]map[string]bool)
@@ -1363,22 +1488,18 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 	for i := range flows {
 		f := &flows[i]
 
-		// Только LAN-клиенты
-		if !isLANIP(f.Key.LocalIP) {
-			continue
-		}
-		// Пропускаем трафик к LAN
-		if isLANIP(f.Key.RemoteIP) {
+		// Только LAN-клиенты, только трафик в интернет.
+		if !isLANIP(f.Key.LocalIP) || isLANIP(f.Key.RemoteIP) {
 			continue
 		}
 
 		ip := f.Key.LocalIP
 		d, ok := devices[ip]
 		if !ok {
-			// MAC: сначала arpTable, потом localMACs
-			mac := ft.arpTable[ip]
+			// MAC: сначала ARP, потом свои интерфейсы.
+			mac := v.arpTable[ip]
 			if mac == "" {
-				mac = ft.localMACs[ip]
+				mac = v.localMACs[ip]
 			}
 			vendor := "unknown"
 			if mac != "" {
@@ -1406,16 +1527,13 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 			d.FirstSeen = f.FirstSeen
 		}
 
-		// Hostname: сначала localHostname (для своего ПК), потом PTR
+		// Hostname: только для собственного ПК (localHostname).
 		if d.Hostname == "" {
-			if _, isLocal := ft.localMACs[d.IP]; isLocal && ft.localHostname != "" {
-				d.Hostname = ft.localHostname
-			} else if f.Hostname != "" {
-				d.Hostname = f.Hostname
+			if _, isLocal := v.localMACs[d.IP]; isLocal && v.localHostname != "" {
+				d.Hostname = v.localHostname
 			}
 		}
 
-		// Домен
 		label := f.SNI
 		if label == "" {
 			label = f.Hostname
@@ -1423,8 +1541,6 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 		if label != "" {
 			domainsByIP[ip][label] = true
 		}
-
-		// Протокол
 		protocolsByIP[ip][f.Key.Proto] = true
 	}
 
@@ -1435,9 +1551,7 @@ func (ft *FlowTable) BuildDevices() []DeviceInfo {
 		out = append(out, *d)
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeen.After(out[j].LastSeen)
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
 	return out
 }
 
@@ -1475,4 +1589,36 @@ func (ft *FlowTable) PrintDevices() {
 			age.String())
 	}
 	fmt.Println()
+}
+
+// --- Утилиты вывода ---
+
+// humanBytes форматирует байты в человекочитаемый вид.
+func humanBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// truncate обрезает строку до max байт, добавляя "…".
+// Не рвёт UTF-8 посередине руны.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max - len("…")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return "…"
+	}
+	return s[:cut] + "…"
 }
