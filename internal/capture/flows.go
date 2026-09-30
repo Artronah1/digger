@@ -238,11 +238,13 @@ type AggregatedFlow struct {
 	MSSKnown bool
 	ECH      bool
 
-	Recon ReconstructionStatus
-	Class Classification
-	Route netmap.RouteInfo
-	JA3   string
-	JA4   string
+	Recon    ReconstructionStatus
+	Class    Classification
+	Route    netmap.RouteInfo
+	JA3      string
+	JA4      string
+	VPNProto string
+	VPNConf  string
 }
 
 // AggregatedApp — суммарная статистика по приложению/устройству.
@@ -728,17 +730,14 @@ func (ft *FlowTable) Enrich() {
 			f.Route = routes[f.Key.RemoteIP]
 		}
 
-		// Прокси-процесс + SNI не резолвится → это VPN-нода.
+		// Прокси-процесс + SNI не резолвится → это прокси-фронт, не VPN.
+		// vpnIPs НЕ пополняется здесь (см. пункт 4.4 ревью).
 		if f.Class == ClassUnknown && f.Comm != "" &&
 			looksLikeProxyProcess(f.Comm) && f.SNI != "" {
 			res := resolveSNIAt(f.SNI, f.Key.RemoteIP, f.LastSeen, ft.dnsMapping)
 			if res.Reason == "not-resolved" {
-				f.Class = ClassVPN
-				ft.vpnIPs[f.Key.RemoteIP] = true
+				f.Class = ClassProxy
 			}
-		}
-		if f.Class == ClassUnknown && ft.vpnIPs[f.Key.RemoteIP] {
-			f.Class = ClassVPN
 		}
 		if f.Class == ClassUnknown {
 			f.Class = ClassifyFlow(f, ft.dnsMapping)
@@ -850,6 +849,10 @@ func (ft *FlowTable) aggregateFrom(flows []FlowStats) []AggregatedFlow {
 		g.BytesIn += f.BytesIn
 		g.Retransmits += f.Retransmits
 		g.Gaps += f.Gaps
+		if g.VPNProto == "" && f.VPNProto != "" {
+			g.VPNProto = f.VPNProto
+			g.VPNConf = f.VPNConf
+		}
 
 		if reconPriority(f.Recon) > reconPriority(g.Recon) {
 			g.Recon = f.Recon
@@ -1425,7 +1428,12 @@ func (ft *FlowTable) MarkVPN(srcIP string, srcPort uint16, dstIP string, dstPort
 		f.VPNProto = det.Proto
 		f.VPNPort = det.Port
 		f.VPNConf = det.Confidence
-		f.Class = ClassVPN
+		// ClassVPN только для high/medium.
+		// low (obfs?) — эвристика по энтропии, может ложно срабатывать
+		// на QUIC/DTLS/WebRTC/Telegram (см. пункт 4.4 ревью).
+		if det.Confidence != "low" {
+			f.Class = ClassVPN
+		}
 	}
 
 	if ft.vpnIPs == nil {

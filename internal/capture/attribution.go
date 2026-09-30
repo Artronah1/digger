@@ -24,10 +24,11 @@ type Attribution struct {
 }
 
 // ProxyReason возвращает причину, по которой связка похожа на прокси.
-// NOTE: в BuildProxySuspicions используется своя логика (resolveSNIAt),
-// и вывод по mismatch ей противоречит. Проверить, задействован ли метод
-// (JSON-вывод?) — иначе удалить.
+// DoH/DNSCrypt — не прокси. Проверяем это первым.
 func (a *Attribution) ProxyReason() string {
+	if IsDoHSNI(a.SNI) {
+		return ""
+	}
 	if a.SNI != "" && len(a.DNSNames) == 0 {
 		return "SNI без DNS — reality/trojan/vless?"
 	}
@@ -115,6 +116,10 @@ func BuildProxySuspicions(flows []FlowStats, mapping *DNSMapping) []ProxySuspici
 	var out []ProxySuspicion
 
 	for _, f := range flows {
+		// DoH/DNSCrypt — DNS через HTTPS, не прокси.
+		if IsDoHSNI(f.SNI) {
+			continue
+		}
 		if !isPublicTCPFlow(f) {
 			continue
 		}

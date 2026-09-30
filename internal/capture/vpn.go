@@ -26,18 +26,20 @@ func detectVPNUDP(payload []byte, dstPort uint16) *VPNDetection {
 	// WireGuard initiation: 148 байт, type=1, reserved=0, mac2 (последние 16) = 0.
 	if len(payload) == 148 && payload[0] == 0x01 &&
 		payload[1] == 0 && payload[2] == 0 && payload[3] == 0 &&
-		isAllZero(payload[132:148]) {
+		!isAllZero(payload[4:8]) && isAllZero(payload[132:148]) {
 		return &VPNDetection{Proto: "WireGuard", Port: dstPort, Confidence: "high"}
 	}
 	// WireGuard response: 92 байта, type=2, reserved=0, mac2 (последние 16) = 0.
 	if len(payload) == 92 && payload[0] == 0x02 &&
 		payload[1] == 0 && payload[2] == 0 && payload[3] == 0 &&
-		isAllZero(payload[76:92]) {
+		!isAllZero(payload[4:8]) && isAllZero(payload[76:92]) {
 		return &VPNDetection{Proto: "WireGuard", Port: dstPort, Confidence: "high"}
 	}
 
 	// OpenVPN (UDP): opcode = payload[0] >> 3.
-	if len(payload) >= 16 {
+	// НЕ детектим на 443: QUIC short header (0x40-0x7F) даёт
+	// opcode 0x08-0x0F, из которых 0x08 и 0x0A совпадают с OpenVPN V2/V3.
+	if dstPort != portHTTPS && len(payload) >= 16 {
 		if d := openvpnReset(payload[0]>>3, dstPort); d != nil {
 			return d
 		}
@@ -61,7 +63,14 @@ func detectVPNUDP(payload []byte, dstPort uint16) *VPNDetection {
 
 func detectVPNTCP(payload []byte, dstPort uint16) *VPNDetection {
 	// OpenVPN over TCP: 2-байтовый префикс длины, opcode в payload[2].
-	if len(payload) >= 16 {
+	// НЕ детектим на 443: TLS/HTTPS/DoH/DNSCrypt-трафик случайно
+	// попадает в opcode (payload[2] >> 3).
+	// OpenVPN-over-TCP на 443 маскируется под HTTPS и без разбора
+	// payload не отличим от обычного TLS.
+	if dstPort == portHTTPS {
+		return nil
+	}
+	if len(payload) >= 18 {
 		if d := openvpnReset(payload[2]>>3, dstPort); d != nil {
 			return d
 		}

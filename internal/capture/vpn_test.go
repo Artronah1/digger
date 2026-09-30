@@ -23,6 +23,10 @@ func randomBytes(n int) []byte {
 func TestWireGuardInitiation(t *testing.T) {
 	p := make([]byte, 148)
 	p[0] = 0x01
+	p[4] = 0x12 // sender index — не нули (WireGuard никогда не имеет sender == 0)
+	p[5] = 0x34
+	p[6] = 0x56
+	p[7] = 0x78
 	det := detectVPN(p, protoUDP, 40000, 51820)
 	if det == nil || det.Proto != "WireGuard" {
 		t.Fatalf("WG initiation не пойман: %+v", det)
@@ -32,6 +36,10 @@ func TestWireGuardInitiation(t *testing.T) {
 func TestWireGuardResponse(t *testing.T) {
 	p := make([]byte, 92)
 	p[0] = 0x02
+	p[4] = 0xAB
+	p[5] = 0xCD
+	p[6] = 0xEF
+	p[7] = 0x12
 	det := detectVPN(p, protoUDP, 51820, 40000)
 	if det == nil || det.Proto != "WireGuard" {
 		t.Fatalf("WG response не пойман: %+v", det)

@@ -241,6 +241,8 @@ type FlowEvent struct {
 	ECH               bool   `json:"ech,omitempty"`
 	JA3               string `json:"ja3,omitempty"`
 	JA4               string `json:"ja4,omitempty"`
+	VPNProto          string `json:"vpn_proto,omitempty"`
+	VPNConf           string `json:"vpn_confidence,omitempty"`
 }
 
 // printFlowsJSON печатает агрегированные потоки.
@@ -283,6 +285,8 @@ func (c *Capture) printFlowsJSON(flows []FlowStats) {
 			ECH:               g.ECH,
 			JA3:               g.JA3,
 			JA4:               g.JA4,
+			VPNProto:          g.VPNProto,
+			VPNConf:           g.VPNConf,
 		})
 	}
 }
