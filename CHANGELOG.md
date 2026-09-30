@@ -1,3 +1,29 @@
+## [0.8.0] — 2026-09-30
+
+### Исправлено
+
+- **VPN-детект**: исключены ложные срабатывания на TLS/QUIC/DoH/DNSCrypt.
+  - `detectVPNTCP`: не детектит на 443 (TLS/HTTPS/DoH/DNSCrypt случайно попадают в opcode `payload[2]>>3`).
+  - `detectVPNUDP`: не детектит OpenVPN на 443 (QUIC short header `0x40-0x7F` даёт ложные opcode `0x08/0x0A`).
+  - WireGuard: ужесточена сигнатура — проверка sender index (`payload[4:8] != 0`).
+- `ClassVPN` в `MarkVPN` — только для `high`/`medium` confidence (не `low`).
+
+### Добавлено
+
+- **`doh.go`**: `knownDoH` + `IsDoHSNI` — детект DoH/DNSCrypt.
+- `BuildProxySuspicions`: пропускает DoH-SNI (не прокси).
+- `ProxyReason`: DoH не прокси (первая проверка).
+
+### Изменено
+
+- `vpn_test.go`: sender index в тестах WireGuard.
+- Все тесты PASS.
+
+### Известные ограничения
+
+- DNSCrypt-серверы (из `dnscrypt-proxy.toml`) не детектятся по SNI — только по IP, а IP-список не загружается автоматически.
+- `knownDoH` — статический список, может устареть.
+
 ## [0.7.0] — 2026-09-30
 
 ### Исправлено
